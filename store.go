@@ -7,19 +7,21 @@ type MessageStore interface {
 	NextSenderMsgSeqNum() int
 	NextTargetMsgSeqNum() int
 
-	IncrNextSenderMsgSeqNum()
-	IncrNextTargetMsgSeqNum()
+	IncrNextSenderMsgSeqNum() error
+	IncrNextTargetMsgSeqNum() error
 
-	SetNextSenderMsgSeqNum(next int)
-	SetNextTargetMsgSeqNum(next int)
+	SetNextSenderMsgSeqNum(next int) error
+	SetNextTargetMsgSeqNum(next int) error
 
 	CreationTime() time.Time
 
-	SaveMessage(seqNum int, msg []byte)
-	GetMessages(beginSeqNum, endSeqNum int) chan []byte
+	SaveMessage(seqNum int, msg []byte) error
+	GetMessages(beginSeqNum, endSeqNum int) ([][]byte, error)
 
-	Refresh()
-	Reset()
+	Refresh() error
+	Reset() error
+
+	Close() error
 }
 
 //The MessageStoreFactory interface is used by session to create a session specific message store
@@ -33,67 +35,80 @@ type memoryStore struct {
 	messageMap                       map[int][]byte
 }
 
-func (store memoryStore) NextSenderMsgSeqNum() int {
+func (store *memoryStore) NextSenderMsgSeqNum() int {
 	return store.senderMsgSeqNum + 1
 }
 
-func (store memoryStore) NextTargetMsgSeqNum() int {
+func (store *memoryStore) NextTargetMsgSeqNum() int {
 	return store.targetMsgSeqNum + 1
 }
 
-func (store *memoryStore) IncrNextSenderMsgSeqNum() {
+func (store *memoryStore) IncrNextSenderMsgSeqNum() error {
 	store.senderMsgSeqNum++
+	return nil
 }
 
-func (store *memoryStore) IncrNextTargetMsgSeqNum() {
+func (store *memoryStore) IncrNextTargetMsgSeqNum() error {
 	store.targetMsgSeqNum++
+	return nil
 }
 
-func (store *memoryStore) SetNextSenderMsgSeqNum(nextSeqNum int) {
+func (store *memoryStore) SetNextSenderMsgSeqNum(nextSeqNum int) error {
 	store.senderMsgSeqNum = nextSeqNum - 1
+	return nil
 }
-func (store *memoryStore) SetNextTargetMsgSeqNum(nextSeqNum int) {
+func (store *memoryStore) SetNextTargetMsgSeqNum(nextSeqNum int) error {
 	store.targetMsgSeqNum = nextSeqNum - 1
+	return nil
 }
 
-func (store memoryStore) CreationTime() time.Time {
+func (store *memoryStore) CreationTime() time.Time {
 	return store.creationTime
 }
 
-func (store *memoryStore) Reset() {
+func (store *memoryStore) Reset() error {
 	store.senderMsgSeqNum = 0
 	store.targetMsgSeqNum = 0
 	store.creationTime = time.Now()
-	store.messageMap = make(map[int][]byte)
+	store.messageMap = nil
+	return nil
 }
 
-func (store *memoryStore) Refresh() {
+func (store *memoryStore) Refresh() error {
 	//nop, nothing to refresh
+	return nil
 }
 
-func (store memoryStore) SaveMessage(seqNum int, msg []byte) {
+func (store *memoryStore) Close() error {
+	//nop, nothing to close
+	return nil
+}
+
+func (store *memoryStore) SaveMessage(seqNum int, msg []byte) error {
+	if store.messageMap == nil {
+		store.messageMap = make(map[int][]byte)
+	}
+
 	store.messageMap[seqNum] = msg
+	return nil
 }
 
-func (store memoryStore) GetMessages(beginSeqNum, endSeqNum int) chan []byte {
-	msgs := make(chan []byte)
-
-	go func() {
-		for seqNum := beginSeqNum; seqNum <= endSeqNum; seqNum++ {
-			if msg, ok := store.messageMap[seqNum]; ok {
-				msgs <- msg
-			}
+func (store *memoryStore) GetMessages(beginSeqNum, endSeqNum int) ([][]byte, error) {
+	var msgs [][]byte
+	for seqNum := beginSeqNum; seqNum <= endSeqNum; seqNum++ {
+		if m, ok := store.messageMap[seqNum]; ok {
+			msgs = append(msgs, m)
 		}
-		close(msgs)
-	}()
-
-	return msgs
+	}
+	return msgs, nil
 }
 
 type memoryStoreFactory struct{}
 
 func (f memoryStoreFactory) Create(sessionID SessionID) (MessageStore, error) {
-	return &memoryStore{messageMap: make(map[int][]byte)}, nil
+	m := new(memoryStore)
+	m.Reset()
+	return m, nil
 }
 
 //NewMemoryStoreFactory returns a MessageStoreFactory instance that created in-memory MessageStores

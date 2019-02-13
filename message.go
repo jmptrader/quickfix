@@ -3,28 +3,99 @@ package quickfix
 import (
 	"bytes"
 	"fmt"
-	"github.com/quickfixgo/quickfix/fix"
-	"github.com/quickfixgo/quickfix/fix/tag"
+	"math"
 	"time"
+
+	"github.com/quickfixgo/quickfix/datadictionary"
 )
+
+//Header is first section of a FIX Message
+type Header struct{ FieldMap }
+
+//in the message header, the first 3 tags in the message header must be 8,9,35
+func headerFieldOrdering(i, j Tag) bool {
+	var ordering = func(t Tag) uint32 {
+		switch t {
+		case tagBeginString:
+			return 1
+		case tagBodyLength:
+			return 2
+		case tagMsgType:
+			return 3
+		}
+
+		return math.MaxUint32
+	}
+
+	orderi := ordering(i)
+	orderj := ordering(j)
+
+	switch {
+	case orderi < orderj:
+		return true
+	case orderi > orderj:
+		return false
+	}
+
+	return i < j
+}
+
+//Init initializes the Header instance
+func (h *Header) Init() {
+	h.initWithOrdering(headerFieldOrdering)
+}
+
+//Body is the primary application section of a FIX message
+type Body struct{ FieldMap }
+
+//Init initializes the FIX message
+func (b *Body) Init() {
+	b.init()
+}
+
+//Trailer is the last section of a FIX message
+type Trailer struct{ FieldMap }
+
+// In the trailer, CheckSum (tag 10) must be last
+func trailerFieldOrdering(i, j Tag) bool {
+	switch {
+	case i == tagCheckSum:
+		return false
+	case j == tagCheckSum:
+		return true
+	}
+
+	return i < j
+}
+
+//Init initializes the FIX message
+func (t *Trailer) Init() {
+	t.initWithOrdering(trailerFieldOrdering)
+}
 
 //Message is a FIX Message abstraction.
 type Message struct {
-	Header  FieldMap
-	Trailer FieldMap
-	Body    FieldMap
+	Header  Header
+	Trailer Trailer
+	Body    Body
 
 	//ReceiveTime is the time that this message was read from the socket connection
 	ReceiveTime time.Time
 
-	rawMessage []byte
+	rawMessage *bytes.Buffer
 
 	//slice of Bytes corresponding to the message body
 	bodyBytes []byte
 
 	//field bytes as they appear in the raw message
-	fields []fieldBytes
+	fields []TagValue
+
+	//flag is true if this message should not be returned to pool after use
+	keepMessage bool
 }
+
+//ToMessage returns the message itself
+func (m *Message) ToMessage() *Message { return m }
 
 //parseError is returned when bytes cannot be parsed as a FIX message.
 type parseError struct {
@@ -33,76 +104,120 @@ type parseError struct {
 
 func (e parseError) Error() string { return fmt.Sprintf("error parsing message: %s", e.OrigError) }
 
-//parseMessage constructs a Message from a byte slice wrapping a FIX message.
-func parseMessage(rawMessage []byte) (*Message, error) {
-	var header, body, trailer fieldMap
-	header.init(headerFieldOrder)
-	body.init(normalFieldOrder)
-	trailer.init(trailerFieldOrder)
+//NewMessage returns a newly initialized Message instance
+func NewMessage() *Message {
+	m := new(Message)
+	m.Header.Init()
+	m.Body.Init()
+	m.Trailer.Init()
 
-	msg := &Message{Header: header, Body: body, Trailer: trailer, rawMessage: rawMessage}
+	return m
+}
+
+// CopyInto erases the dest messages and copies the curreny message content
+// into it.
+func (m *Message) CopyInto(to *Message) {
+	m.Header.CopyInto(&to.Header.FieldMap)
+	m.Body.CopyInto(&to.Body.FieldMap)
+	m.Trailer.CopyInto(&to.Trailer.FieldMap)
+
+	to.ReceiveTime = m.ReceiveTime
+	to.bodyBytes = make([]byte, len(m.bodyBytes))
+	copy(to.bodyBytes, m.bodyBytes)
+	to.fields = make([]TagValue, len(m.fields))
+	for i := range to.fields {
+		to.fields[i].init(m.fields[i].tag, m.fields[i].value)
+	}
+}
+
+//ParseMessage constructs a Message from a byte slice wrapping a FIX message.
+func ParseMessage(msg *Message, rawMessage *bytes.Buffer) (err error) {
+	return ParseMessageWithDataDictionary(msg, rawMessage, nil, nil)
+}
+
+//ParseMessageWithDataDictionary constructs a Message from a byte slice wrapping a FIX message using an optional session and application DataDictionary for reference.
+func ParseMessageWithDataDictionary(
+	msg *Message,
+	rawMessage *bytes.Buffer,
+	transportDataDictionary *datadictionary.DataDictionary,
+	applicationDataDictionary *datadictionary.DataDictionary,
+) (err error) {
+	msg.Header.Clear()
+	msg.Body.Clear()
+	msg.Trailer.Clear()
+	msg.rawMessage = rawMessage
+
+	rawBytes := rawMessage.Bytes()
 
 	//allocate fields in one chunk
 	fieldCount := 0
-	for _, b := range rawMessage {
+	for _, b := range rawBytes {
 		if b == '\001' {
 			fieldCount++
 		}
 	}
-	msg.fields = make([]fieldBytes, fieldCount)
 
-	fieldIndex := 0
-	var err error
-
-	//message must start with begin string, body length, msg type
-	if rawMessage, err = extractSpecificField(&msg.fields[fieldIndex], tag.BeginString, rawMessage); err != nil {
-		return nil, err
+	if fieldCount == 0 {
+		return parseError{OrigError: fmt.Sprintf("No Fields detected in %s", string(rawBytes))}
 	}
 
-	header.fieldLookup[msg.fields[fieldIndex].Tag] = &msg.fields[fieldIndex]
+	if cap(msg.fields) < fieldCount {
+		msg.fields = make([]TagValue, fieldCount)
+	} else {
+		msg.fields = msg.fields[0:fieldCount]
+	}
+
+	fieldIndex := 0
+
+	//message must start with begin string, body length, msg type
+	if rawBytes, err = extractSpecificField(&msg.fields[fieldIndex], tagBeginString, rawBytes); err != nil {
+		return
+	}
+
+	msg.Header.add(msg.fields[fieldIndex : fieldIndex+1])
 	fieldIndex++
 
 	parsedFieldBytes := &msg.fields[fieldIndex]
-	if rawMessage, err = extractSpecificField(parsedFieldBytes, tag.BodyLength, rawMessage); err != nil {
-		return nil, err
+	if rawBytes, err = extractSpecificField(parsedFieldBytes, tagBodyLength, rawBytes); err != nil {
+		return
 	}
 
-	header.fieldLookup[parsedFieldBytes.Tag] = parsedFieldBytes
+	msg.Header.add(msg.fields[fieldIndex : fieldIndex+1])
 	fieldIndex++
 
 	parsedFieldBytes = &msg.fields[fieldIndex]
-	if rawMessage, err = extractSpecificField(parsedFieldBytes, tag.MsgType, rawMessage); err != nil {
-		return nil, err
+	if rawBytes, err = extractSpecificField(parsedFieldBytes, tagMsgType, rawBytes); err != nil {
+		return
 	}
 
-	header.fieldLookup[parsedFieldBytes.Tag] = parsedFieldBytes
+	msg.Header.add(msg.fields[fieldIndex : fieldIndex+1])
 	fieldIndex++
 
 	trailerBytes := []byte{}
 	foundBody := false
 	for {
 		parsedFieldBytes = &msg.fields[fieldIndex]
-		rawMessage, err = extractField(parsedFieldBytes, rawMessage)
+		rawBytes, err = extractField(parsedFieldBytes, rawBytes)
 		if err != nil {
-			return nil, err
+			return
 		}
 
 		switch {
-		case tag.IsHeader(parsedFieldBytes.Tag):
-			header.fieldLookup[parsedFieldBytes.Tag] = parsedFieldBytes
-		case tag.IsTrailer(parsedFieldBytes.Tag):
-			trailer.fieldLookup[parsedFieldBytes.Tag] = parsedFieldBytes
+		case isHeaderField(parsedFieldBytes.tag, transportDataDictionary):
+			msg.Header.add(msg.fields[fieldIndex : fieldIndex+1])
+		case isTrailerField(parsedFieldBytes.tag, transportDataDictionary):
+			msg.Trailer.add(msg.fields[fieldIndex : fieldIndex+1])
 		default:
 			foundBody = true
-			trailerBytes = rawMessage
-			body.fieldLookup[parsedFieldBytes.Tag] = parsedFieldBytes
+			trailerBytes = rawBytes
+			msg.Body.add(msg.fields[fieldIndex : fieldIndex+1])
 		}
-		if parsedFieldBytes.Tag == tag.CheckSum {
+		if parsedFieldBytes.tag == tagCheckSum {
 			break
 		}
 
 		if !foundBody {
-			msg.bodyBytes = rawMessage
+			msg.bodyBytes = rawBytes
 		}
 
 		fieldIndex++
@@ -115,72 +230,115 @@ func parseMessage(rawMessage []byte) (*Message, error) {
 
 	length := 0
 	for _, field := range msg.fields {
-		switch field.Tag {
-		case tag.BeginString, tag.BodyLength, tag.CheckSum: //tags do not contribute to length
+		switch field.tag {
+		case tagBeginString, tagBodyLength, tagCheckSum: //tags do not contribute to length
 		default:
-			length += field.Length()
+			length += field.length()
 		}
 	}
 
-	bodyLength := new(fix.IntValue)
-	msg.Header.GetField(tag.BodyLength, bodyLength)
-	if bodyLength.Value != length {
-		return msg, parseError{OrigError: fmt.Sprintf("Incorrect Message Length, expected %d, got %d", bodyLength.Value, length)}
+	bodyLength, err := msg.Header.GetInt(tagBodyLength)
+	if err != nil {
+		err = parseError{OrigError: err.Error()}
+	} else if length != bodyLength {
+		err = parseError{OrigError: fmt.Sprintf("Incorrect Message Length, expected %d, got %d", bodyLength, length)}
 	}
 
-	return msg, nil
+	return
+
+}
+
+func isHeaderField(tag Tag, dataDict *datadictionary.DataDictionary) bool {
+	if tag.IsHeader() {
+		return true
+	}
+
+	if dataDict == nil {
+		return false
+	}
+
+	_, ok := dataDict.Header.Fields[int(tag)]
+	return ok
+}
+
+func isTrailerField(tag Tag, dataDict *datadictionary.DataDictionary) bool {
+	if tag.IsTrailer() {
+		return true
+	}
+
+	if dataDict == nil {
+		return false
+	}
+
+	_, ok := dataDict.Trailer.Fields[int(tag)]
+	return ok
+}
+
+// MsgType returns MsgType (tag 35) field's value
+func (m *Message) MsgType() (string, MessageRejectError) {
+	return m.Header.GetString(tagMsgType)
+}
+
+// IsMsgTypeOf returns true if the Header contains MsgType (tag 35) field and its value is the specified one.
+func (m *Message) IsMsgTypeOf(msgType string) bool {
+	if v, err := m.MsgType(); err == nil {
+		return v == msgType
+	}
+	return false
 }
 
 //reverseRoute returns a message builder with routing header fields initialized as the reverse of this message.
-func (m *Message) reverseRoute() MessageBuilder {
-	reverseBuilder := NewMessageBuilder()
+func (m *Message) reverseRoute() *Message {
+	reverseMsg := NewMessage()
 
-	copy := func(src fix.Tag, dest fix.Tag) {
-		if field := new(fix.StringValue); m.Header.GetField(src, field) == nil {
-			if len(field.Value) != 0 {
-				reverseBuilder.Header().SetField(dest, field)
+	copy := func(src Tag, dest Tag) {
+		var field FIXString
+		if m.Header.GetField(src, &field) == nil {
+			if len(field) != 0 {
+				reverseMsg.Header.SetField(dest, field)
 			}
 		}
 	}
 
-	copy(tag.SenderCompID, tag.TargetCompID)
-	copy(tag.SenderSubID, tag.TargetSubID)
-	copy(tag.SenderLocationID, tag.TargetLocationID)
+	copy(tagSenderCompID, tagTargetCompID)
+	copy(tagSenderSubID, tagTargetSubID)
+	copy(tagSenderLocationID, tagTargetLocationID)
 
-	copy(tag.TargetCompID, tag.SenderCompID)
-	copy(tag.TargetSubID, tag.SenderSubID)
-	copy(tag.TargetLocationID, tag.SenderLocationID)
+	copy(tagTargetCompID, tagSenderCompID)
+	copy(tagTargetSubID, tagSenderSubID)
+	copy(tagTargetLocationID, tagSenderLocationID)
 
-	copy(tag.OnBehalfOfCompID, tag.DeliverToCompID)
-	copy(tag.OnBehalfOfSubID, tag.DeliverToSubID)
-	copy(tag.DeliverToCompID, tag.OnBehalfOfCompID)
-	copy(tag.DeliverToSubID, tag.OnBehalfOfSubID)
+	copy(tagOnBehalfOfCompID, tagDeliverToCompID)
+	copy(tagOnBehalfOfSubID, tagDeliverToSubID)
+	copy(tagDeliverToCompID, tagOnBehalfOfCompID)
+	copy(tagDeliverToSubID, tagOnBehalfOfSubID)
 
 	//tags added in 4.1
-	if beginString := new(fix.StringValue); m.Header.GetField(tag.BeginString, beginString) == nil {
-		if beginString.Value != fix.BeginString_FIX40 {
-			copy(tag.OnBehalfOfLocationID, tag.DeliverToLocationID)
-			copy(tag.DeliverToLocationID, tag.OnBehalfOfLocationID)
+	var beginString FIXString
+	if m.Header.GetField(tagBeginString, &beginString) == nil {
+		if string(beginString) != BeginStringFIX40 {
+			copy(tagOnBehalfOfLocationID, tagDeliverToLocationID)
+			copy(tagDeliverToLocationID, tagOnBehalfOfLocationID)
 		}
 	}
 
-	return reverseBuilder
+	return reverseMsg
 }
 
-func extractSpecificField(field *fieldBytes, expectedTag fix.Tag, buffer []byte) (remBuffer []byte, err error) {
+func extractSpecificField(field *TagValue, expectedTag Tag, buffer []byte) (remBuffer []byte, err error) {
 	remBuffer, err = extractField(field, buffer)
 	switch {
 	case err != nil:
 		return
-	case field.Tag != expectedTag:
-		err = parseError{OrigError: fmt.Sprintf("extractSpecificField: Fields out of order, expected %d, got %d", expectedTag, field.Tag)}
+	case field.tag != expectedTag:
+		err = parseError{OrigError: fmt.Sprintf("extractSpecificField: Fields out of order, expected %d, got %d", expectedTag, field.tag)}
 		return
 	}
 
 	return
 }
 
-func extractField(parsedFieldBytes *fieldBytes, buffer []byte) (remBytes []byte, err error) {
+func extractField(parsedFieldBytes *TagValue, buffer []byte) (remBytes []byte, err error) {
 	endIndex := bytes.IndexByte(buffer, '\001')
 	if endIndex == -1 {
 		err = parseError{OrigError: "extractField: No Trailing Delim in " + string(buffer)}
@@ -188,36 +346,36 @@ func extractField(parsedFieldBytes *fieldBytes, buffer []byte) (remBytes []byte,
 		return
 	}
 
-	err = parsedFieldBytes.parseField(buffer[:endIndex+1])
+	err = parsedFieldBytes.parse(buffer[:endIndex+1])
 	return buffer[(endIndex + 1):], err
 }
 
 func (m *Message) String() string {
-	return string(m.rawMessage)
-}
-
-func newCheckSum(value int) *fix.StringField {
-	return fix.NewStringField(tag.CheckSum, fmt.Sprintf("%03d", value))
-}
-
-func (m *Message) rebuild() {
-	header := m.Header.(fieldMap)
-	trailer := m.Trailer.(fieldMap)
-
-	bodyLength := header.length() + len(m.bodyBytes) + trailer.length()
-	header.Set(fix.NewIntField(tag.BodyLength, bodyLength))
-	checkSum := header.total() + trailer.total()
-	for _, b := range m.bodyBytes {
-		checkSum += int(b)
+	if m.rawMessage != nil {
+		return m.rawMessage.String()
 	}
-	checkSum %= 256
 
-	trailer.Set(newCheckSum(checkSum))
+	return string(m.build())
+}
+
+func formatCheckSum(value int) string {
+	return fmt.Sprintf("%03d", value)
+}
+
+//Build constructs a []byte from a Message instance
+func (m *Message) build() []byte {
+	m.cook()
 
 	var b bytes.Buffer
-	header.write(&b)
-	b.Write(m.bodyBytes)
-	trailer.write(&b)
+	m.Header.write(&b)
+	m.Body.write(&b)
+	m.Trailer.write(&b)
+	return b.Bytes()
+}
 
-	m.rawMessage = b.Bytes()
+func (m *Message) cook() {
+	bodyLength := m.Header.length() + m.Body.length() + m.Trailer.length()
+	m.Header.SetInt(tagBodyLength, bodyLength)
+	checkSum := (m.Header.total() + m.Body.total() + m.Trailer.total()) % 256
+	m.Trailer.SetString(tagCheckSum, formatCheckSum(checkSum))
 }

@@ -1,9 +1,13 @@
 package quickfix
 
 import (
-	"fmt"
-	"github.com/quickfixgo/quickfix/config"
+	"bufio"
+	"crypto/tls"
 	"net"
+	"sync"
+	"time"
+
+	"github.com/quickfixgo/quickfix/config"
 )
 
 //Initiator initiates connections and processes messages for all sessions.
@@ -14,54 +18,62 @@ type Initiator struct {
 	storeFactory    MessageStoreFactory
 	logFactory      LogFactory
 	globalLog       Log
-	quitChans       map[SessionID]chan bool
+	stopChan        chan interface{}
+	wg              sync.WaitGroup
+	sessions        map[SessionID]*session
+	sessionFactory
 }
 
 //Start Initiator.
-func (i *Initiator) Start() error {
+func (i *Initiator) Start() (err error) {
+	i.stopChan = make(chan interface{})
 
-	for sessionID, s := range i.sessionSettings {
-		socketConnectHost, err := s.Setting(config.SocketConnectHost)
-		if err != nil {
-			return fmt.Errorf("error on SocketConnectHost: %v", err)
+	for sessionID, settings := range i.sessionSettings {
+		//TODO: move into session factory
+		var tlsConfig *tls.Config
+		if tlsConfig, err = loadTLSConfig(settings); err != nil {
+			return
 		}
 
-		socketConnectPort, err := s.IntSetting(config.SocketConnectPort)
-		if err != nil {
-			return fmt.Errorf("error on SocketConnectPort: %v", err)
+		dialTimeout := time.Duration(0)
+		if settings.HasSetting(config.SocketTimeout) {
+			if dialTimeout, err = settings.DurationSetting(config.SocketTimeout); err != nil {
+				return
+			}
 		}
-
-		conn, err := net.Dial("tcp", fmt.Sprintf("%v:%v", socketConnectHost, socketConnectPort))
-		if err != nil {
-			return err
-		}
-
-		i.quitChans[sessionID] = make(chan bool)
-		go handleInitiatorConnection(conn, i.globalLog, sessionID, i.quitChans[sessionID])
+		i.wg.Add(1)
+		go func(sessID SessionID) {
+			i.handleConnection(i.sessions[sessID], tlsConfig, dialTimeout)
+			i.wg.Done()
+		}(sessionID)
 	}
 
-	return nil
+	return
 }
 
 //Stop Initiator.
 func (i *Initiator) Stop() {
-	defer func() {
-		_ = recover() // suppress sending on closed channel error
-	}()
-	for _, channel := range i.quitChans {
-		channel <- true
+	select {
+	case <-i.stopChan:
+		//closed already
+		return
+	default:
 	}
+	close(i.stopChan)
+	i.wg.Wait()
 }
 
 //NewInitiator creates and initializes a new Initiator.
 func NewInitiator(app Application, storeFactory MessageStoreFactory, appSettings *Settings, logFactory LogFactory) (*Initiator, error) {
-	i := new(Initiator)
-	i.app = app
-	i.storeFactory = storeFactory
-	i.settings = appSettings
-	i.sessionSettings = appSettings.SessionSettings()
-	i.logFactory = logFactory
-	i.quitChans = make(map[SessionID]chan bool)
+	i := &Initiator{
+		app:             app,
+		storeFactory:    storeFactory,
+		settings:        appSettings,
+		sessionSettings: appSettings.SessionSettings(),
+		logFactory:      logFactory,
+		sessions:        make(map[SessionID]*session),
+		sessionFactory:  sessionFactory{true},
+	}
 
 	var err error
 	i.globalLog, err = logFactory.Create()
@@ -70,21 +82,123 @@ func NewInitiator(app Application, storeFactory MessageStoreFactory, appSettings
 	}
 
 	for sessionID, s := range i.sessionSettings {
-
-		//fail fast
-		if ok := s.HasSetting(config.SocketConnectHost); !ok {
-			return nil, requiredConfigurationMissing(config.SocketConnectHost)
-		}
-
-		if ok := s.HasSetting(config.SocketConnectPort); !ok {
-			return nil, requiredConfigurationMissing(config.SocketConnectPort)
-		}
-
-		err = createSession(sessionID, storeFactory, s, logFactory, app)
+		session, err := i.createSession(sessionID, storeFactory, s, logFactory, app)
 		if err != nil {
 			return nil, err
 		}
+
+		i.sessions[sessionID] = session
 	}
 
 	return i, nil
+}
+
+//waitForInSessionTime returns true if the session is in session, false if the handler should stop
+func (i *Initiator) waitForInSessionTime(session *session) bool {
+	inSessionTime := make(chan interface{})
+	go func() {
+		session.waitForInSessionTime()
+		close(inSessionTime)
+	}()
+
+	select {
+	case <-inSessionTime:
+	case <-i.stopChan:
+		return false
+	}
+
+	return true
+}
+
+//watiForReconnectInterval returns true if a reconnect should be re-attempted, false if handler should stop
+func (i *Initiator) waitForReconnectInterval(reconnectInterval time.Duration) bool {
+	select {
+	case <-time.After(reconnectInterval):
+	case <-i.stopChan:
+		return false
+	}
+
+	return true
+}
+
+func (i *Initiator) handleConnection(session *session, tlsConfig *tls.Config, dialTimeout time.Duration) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		session.run()
+		wg.Done()
+	}()
+
+	defer func() {
+		session.stop()
+		wg.Wait()
+	}()
+
+	connectionAttempt := 0
+
+	for {
+		if !i.waitForInSessionTime(session) {
+			return
+		}
+
+		var disconnected chan interface{}
+		var msgIn chan fixIn
+		var msgOut chan []byte
+
+		address := session.SocketConnectAddress[connectionAttempt%len(session.SocketConnectAddress)]
+		session.log.OnEventf("Connecting to: %v", address)
+
+		var netConn net.Conn
+		if tlsConfig != nil {
+			tlsConn, err := tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", address, tlsConfig)
+			if err != nil {
+				session.log.OnEventf("Failed to connect: %v", err)
+				goto reconnect
+			}
+
+			err = tlsConn.Handshake()
+			if err != nil {
+				session.log.OnEventf("Failed handshake:%v", err)
+				goto reconnect
+			}
+			netConn = tlsConn
+		} else {
+			var err error
+			netConn, err = net.Dial("tcp", address)
+			if err != nil {
+				session.log.OnEventf("Failed to connect: %v", err)
+				goto reconnect
+			}
+		}
+
+		msgIn = make(chan fixIn)
+		msgOut = make(chan []byte)
+		if err := session.connect(msgIn, msgOut); err != nil {
+			session.log.OnEventf("Failed to initiate: %v", err)
+			goto reconnect
+		}
+
+		go readLoop(newParser(bufio.NewReader(netConn)), msgIn)
+		disconnected = make(chan interface{})
+		go func() {
+			writeLoop(netConn, msgOut, session.log)
+			if err := netConn.Close(); err != nil {
+				session.log.OnEvent(err.Error())
+			}
+			close(disconnected)
+		}()
+
+		select {
+		case <-disconnected:
+		case <-i.stopChan:
+			return
+		}
+
+	reconnect:
+		connectionAttempt++
+		session.log.OnEventf("Reconnecting in %v", session.ReconnectInterval)
+		if !i.waitForReconnectInterval(session.ReconnectInterval) {
+			return
+		}
+	}
 }

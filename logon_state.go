@@ -1,32 +1,66 @@
 package quickfix
 
 import (
-	"github.com/quickfixgo/quickfix/fix"
-	"github.com/quickfixgo/quickfix/fix/tag"
+	"bytes"
+
+	"github.com/quickfixgo/quickfix/internal"
 )
 
-type logonState struct{}
+type logonState struct{ connectedNotLoggedOn }
 
-func (s logonState) FixMsgIn(session *Session, msg Message) (nextState sessionState) {
-	msgType := new(fix.StringValue)
-	if err := msg.Header.GetField(tag.MsgType, msgType); err == nil && msgType.Value == "A" {
-		if err := session.handleLogon(msg); err != nil {
-			session.log.OnEvent(err.Error())
-			return latentState{}
-		}
+func (s logonState) String() string { return "Logon State" }
 
-		return inSession{}
+func (s logonState) FixMsgIn(session *session, msg *Message) (nextState sessionState) {
+	msgType, err := msg.Header.GetBytes(tagMsgType)
+	if err != nil {
+		return handleStateError(session, err)
 	}
 
-	session.log.OnEventf("Invalid Session State: Received Msg %v while waiting for Logon", msg)
-	return latentState{}
-}
-
-func (s logonState) Timeout(session *Session, e event) (nextState sessionState) {
-	if e == logonTimeout {
-		session.log.OnEvent("Timed out waiting for logon response")
+	if !bytes.Equal(msgType, msgTypeLogon) {
+		session.log.OnEventf("Invalid Session State: Received Msg %s while waiting for Logon", msg)
 		return latentState{}
 	}
 
+	if err := session.handleLogon(msg); err != nil {
+		switch err := err.(type) {
+		case RejectLogon:
+			session.log.OnEvent(err.Text)
+			logout := session.buildLogout(err.Text)
+
+			if err := session.dropAndSendInReplyTo(logout, msg); err != nil {
+				session.logError(err)
+			}
+
+			if err := session.store.IncrNextTargetMsgSeqNum(); err != nil {
+				session.logError(err)
+			}
+
+			return latentState{}
+
+		case targetTooHigh:
+			var tooHighErr error
+			if nextState, tooHighErr = session.doTargetTooHigh(err); tooHighErr != nil {
+				return handleStateError(session, tooHighErr)
+			}
+
+			return
+
+		default:
+			return handleStateError(session, err)
+		}
+	}
+	return inSession{}
+}
+
+func (s logonState) Timeout(session *session, e internal.Event) (nextState sessionState) {
+	switch e {
+	case internal.LogonTimeout:
+		session.log.OnEvent("Timed out waiting for logon response")
+		return latentState{}
+	}
 	return s
+}
+
+func (s logonState) Stop(session *session) (nextState sessionState) {
+	return latentState{}
 }

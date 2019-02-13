@@ -1,15 +1,17 @@
 package quickfix
 
+import "github.com/quickfixgo/quickfix/internal"
+
 type pendingTimeout struct {
-	inSession
+	sessionState
 }
 
-func (currentState pendingTimeout) Timeout(session *Session, event event) (nextState sessionState) {
+func (s pendingTimeout) Timeout(session *session, event internal.Event) (nextState sessionState) {
 	switch event {
-	case peerTimeout:
+	case internal.PeerTimeout:
 		session.log.OnEvent("Session Timeout")
 		return latentState{}
 	}
 
-	return currentState
+	return s
 }

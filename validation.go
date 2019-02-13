@@ -2,147 +2,190 @@ package quickfix
 
 import (
 	"github.com/quickfixgo/quickfix/datadictionary"
-	"github.com/quickfixgo/quickfix/fix"
-	"github.com/quickfixgo/quickfix/fix/tag"
 )
 
-//validate tests the message against the provided data dictionary.
-func validate(d *datadictionary.DataDictionary, msg Message) MessageRejectError {
-	msgType := new(fix.StringField)
-	if err := msg.Header.GetField(tag.MsgType, msgType); err != nil {
-		if err.RejectReason() == rejectReasonConditionallyRequiredFieldMissing {
-			return requiredTagMissing(tag.MsgType)
+type validator interface {
+	Validate(*Message) MessageRejectError
+}
+
+type validatorSettings struct {
+	CheckFieldsOutOfOrder bool
+	RejectInvalidMessage bool
+
+}
+
+//Default configuration for message validation.
+//See http://www.quickfixengine.org/quickfix/doc/html/configuration.html.
+var defaultValidatorSettings = validatorSettings{
+	CheckFieldsOutOfOrder: true,
+	RejectInvalidMessage: true,
+}
+
+type fixValidator struct {
+	dataDictionary *datadictionary.DataDictionary
+	settings       validatorSettings
+}
+
+type fixtValidator struct {
+	transportDataDictionary *datadictionary.DataDictionary
+	appDataDictionary       *datadictionary.DataDictionary
+	settings                validatorSettings
+}
+
+//Validate tests the message against the provided data dictionary.
+func (v *fixValidator) Validate(msg *Message) MessageRejectError {
+	if !msg.Header.Has(tagMsgType) {
+		return RequiredTagMissing(tagMsgType)
+	}
+	msgType, err := msg.Header.GetString(tagMsgType)
+	if err != nil {
+		return err
+	}
+
+	return validateFIX(v.dataDictionary, v.settings, msgType, msg)
+}
+
+//Validate tests the message against the provided transport and app data dictionaries.
+//If the message is an admin message, it will be validated against the transport data dictionary.
+func (v *fixtValidator) Validate(msg *Message) MessageRejectError {
+	if !msg.Header.Has(tagMsgType) {
+		return RequiredTagMissing(tagMsgType)
+	}
+	msgType, err := msg.Header.GetString(tagMsgType)
+	if err != nil {
+		return err
+	}
+
+	if isAdminMessageType([]byte(msgType)) {
+		return validateFIX(v.transportDataDictionary, v.settings, msgType, msg)
+	}
+	return validateFIXT(v.transportDataDictionary, v.appDataDictionary, v.settings, msgType, msg)
+}
+
+func validateFIX(d *datadictionary.DataDictionary, settings validatorSettings, msgType string, msg *Message) MessageRejectError {
+	if err := validateMsgType(d, msgType, msg); err != nil {
+		return err
+	}
+
+	if err := validateRequired(d, d, msgType, msg); err != nil {
+		return err
+	}
+
+	if settings.CheckFieldsOutOfOrder {
+		if err := validateOrder(msg); err != nil {
+			return err
+		}
+	}
+
+	if settings.RejectInvalidMessage {
+		if err := validateFields(d, d, msgType, msg); err != nil {
+			return err
 		}
 
+		if err := validateWalk(d, d, msgType, msg); err != nil {
+			return err
+		}
+	}
+
+
+
+	return nil
+}
+
+func validateFIXT(transportDD, appDD *datadictionary.DataDictionary, settings validatorSettings, msgType string, msg *Message) MessageRejectError {
+	if err := validateMsgType(appDD, msgType, msg); err != nil {
 		return err
 	}
 
-	if _, validMsgType := d.Messages[msgType.Value]; validMsgType == false {
-		return invalidMessageType()
-	}
-
-	if err := validateRequired(d, d, msgType.Value, msg); err != nil {
+	if err := validateRequired(transportDD, appDD, msgType, msg); err != nil {
 		return err
 	}
 
-	if err := validateOrder(msg); err != nil {
+	if settings.CheckFieldsOutOfOrder {
+		if err := validateOrder(msg); err != nil {
+			return err
+		}
+	}
+
+	if err := validateWalk(transportDD, appDD, msgType, msg); err != nil {
 		return err
 	}
 
-	if err := validateFields(d, d, msgType.Value, msg); err != nil {
-		return err
-	}
-
-	if err := validateWalk(d, d, msg); err != nil {
+	if err := validateFields(transportDD, appDD, msgType, msg); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func validateFIXTApp(transportDD *datadictionary.DataDictionary, appDD *datadictionary.DataDictionary, msg Message) MessageRejectError {
-	msgType := new(fix.StringField)
-	if err := msg.Header.GetField(tag.MsgType, msgType); err != nil {
-		if err.RejectReason() == rejectReasonConditionallyRequiredFieldMissing {
-			return requiredTagMissing(tag.MsgType)
-		}
-
-		return err
+func validateMsgType(d *datadictionary.DataDictionary, msgType string, msg *Message) MessageRejectError {
+	if _, validMsgType := d.Messages[msgType]; validMsgType == false {
+		return InvalidMessageType()
 	}
-
-	if _, validMsgType := appDD.Messages[msgType.Value]; validMsgType == false {
-		return invalidMessageType()
-	}
-
-	if err := validateRequired(transportDD, appDD, msgType.Value, msg); err != nil {
-		return err
-	}
-
-	if err := validateOrder(msg); err != nil {
-		return err
-	}
-
-	if err := validateWalk(transportDD, appDD, msg); err != nil {
-		return err
-	}
-
-	if err := validateFields(transportDD, appDD, msgType.Value, msg); err != nil {
-		return err
-	}
-
 	return nil
 }
 
-func validateWalk(transportDD *datadictionary.DataDictionary, appDD *datadictionary.DataDictionary, msg Message) MessageRejectError {
+func validateWalk(transportDD *datadictionary.DataDictionary, appDD *datadictionary.DataDictionary, msgType string, msg *Message) MessageRejectError {
 	remainingFields := msg.fields
+	iteratedTags := make(datadictionary.TagSet)
+
+	var messageDef *datadictionary.MessageDef
+	var fieldDef *datadictionary.FieldDef
 	var err MessageRejectError
+	var ok bool
 
-	if remainingFields, err = validateWalkComponent(transportDD.Header, remainingFields); err != nil {
-		return err
-	}
+	for len(remainingFields) > 0 {
+		field := remainingFields[0]
+		tag := field.tag
 
-	msgType := new(fix.StringField)
-	msg.Header.GetField(tag.MsgType, msgType)
+		switch {
+		case tag.IsHeader():
+			messageDef = transportDD.Header
+		case tag.IsTrailer():
+			messageDef = transportDD.Trailer
+		default: // is body
+			messageDef = appDD.Messages[msgType]
+		}
 
-	if remainingFields, err = validateWalkComponent(appDD.Messages[msgType.Value], remainingFields); err != nil {
-		return err
-	}
+		if fieldDef, ok = messageDef.Fields[int(tag)]; !ok {
+			return TagNotDefinedForThisMessageType(tag)
+		}
 
-	if remainingFields, err = validateWalkComponent(transportDD.Trailer, remainingFields); err != nil {
-		return err
+		if _, duplicate := iteratedTags[int(tag)]; duplicate {
+			return tagAppearsMoreThanOnce(tag)
+		}
+		iteratedTags.Add(int(tag))
+
+		if remainingFields, err = validateVisitField(fieldDef, remainingFields); err != nil {
+			return err
+		}
 	}
 
 	if len(remainingFields) != 0 {
-		return tagNotDefinedForThisMessageType(remainingFields[0].Tag)
+		return TagNotDefinedForThisMessageType(remainingFields[0].tag)
 	}
 
 	return nil
 }
 
-func validateWalkComponent(messageDef *datadictionary.MessageDef, fields []fieldBytes) ([]fieldBytes, MessageRejectError) {
-	var fieldDef *datadictionary.FieldDef
-	var ok bool
-	var err MessageRejectError
-	iteratedTags := make(datadictionary.TagSet)
-
-	for len(fields) > 0 {
-		field := fields[0]
-		//field not defined for this component
-		if fieldDef, ok = messageDef.Fields[field.Tag]; !ok {
-			break
-		}
-
-		if _, duplicate := iteratedTags[field.Tag]; duplicate {
-			return nil, tagAppearsMoreThanOnce(field.Tag)
-		}
-		iteratedTags.Add(field.Tag)
-
-		if fields, err = validateVisitField(fieldDef, fields); err != nil {
-			return nil, err
-		}
-	}
-
-	return fields, nil
-}
-
-func validateVisitField(fieldDef *datadictionary.FieldDef, fields []fieldBytes) ([]fieldBytes, MessageRejectError) {
-	var err MessageRejectError
-
+func validateVisitField(fieldDef *datadictionary.FieldDef, fields []TagValue) ([]TagValue, MessageRejectError) {
 	if fieldDef.IsGroup() {
+		var err MessageRejectError
 		if fields, err = validateVisitGroupField(fieldDef, fields); err != nil {
 			return nil, err
 		}
+		return fields, nil
 	}
 
 	return fields[1:], nil
 }
 
-func validateVisitGroupField(fieldDef *datadictionary.FieldDef, fieldStack []fieldBytes) ([]fieldBytes, MessageRejectError) {
-	numInGroupTag := fieldStack[0].Tag
-	numInGroup := new(fix.IntValue)
+func validateVisitGroupField(fieldDef *datadictionary.FieldDef, fieldStack []TagValue) ([]TagValue, MessageRejectError) {
+	numInGroupTag := fieldStack[0].tag
+	var numInGroup FIXInt
 
-	if err := numInGroup.Read(fieldStack[0].Value); err != nil {
-		return nil, incorrectDataFormatForValue(numInGroupTag)
+	if err := numInGroup.Read(fieldStack[0].value); err != nil {
+		return nil, IncorrectDataFormatForValue(numInGroupTag)
 	}
 
 	fieldStack = fieldStack[1:]
@@ -153,8 +196,8 @@ func validateVisitGroupField(fieldDef *datadictionary.FieldDef, fieldStack []fie
 	for len(fieldStack) > 0 {
 
 		//start of repeating group
-		if fieldStack[0].Tag == fieldDef.ChildFields[0].Tag {
-			childDefs = fieldDef.ChildFields
+		if int(fieldStack[0].tag) == fieldDef.Fields[0].Tag() {
+			childDefs = fieldDef.Fields
 			groupCount++
 		}
 
@@ -163,42 +206,41 @@ func validateVisitGroupField(fieldDef *datadictionary.FieldDef, fieldStack []fie
 			break
 		}
 
-		if fieldStack[0].Tag == childDefs[0].Tag {
+		if int(fieldStack[0].tag) == childDefs[0].Tag() {
 			var err MessageRejectError
 			if fieldStack, err = validateVisitField(childDefs[0], fieldStack); err != nil {
 				return fieldStack, err
 			}
 		} else {
-			if childDefs[0].Required {
-				return fieldStack, requiredTagMissing(childDefs[0].Tag)
+			if childDefs[0].Required() {
+				return fieldStack, RequiredTagMissing(Tag(childDefs[0].Tag()))
 			}
 		}
 
 		childDefs = childDefs[1:]
 	}
 
-	if groupCount != numInGroup.Value {
+	if groupCount != int(numInGroup) {
 		return fieldStack, incorrectNumInGroupCountForRepeatingGroup(numInGroupTag)
 	}
 
 	return fieldStack, nil
 }
 
-func validateOrder(msg Message) MessageRejectError {
-
+func validateOrder(msg *Message) MessageRejectError {
 	inHeader := true
 	inTrailer := false
 	for _, field := range msg.fields {
-		t := field.Tag
+		t := field.tag
 		switch {
-		case inHeader && tag.IsHeader(t):
-		case inHeader && !tag.IsHeader(t):
+		case inHeader && t.IsHeader():
+		case inHeader && !t.IsHeader():
 			inHeader = false
-		case !inHeader && tag.IsHeader(t):
+		case !inHeader && t.IsHeader():
 			return tagSpecifiedOutOfRequiredOrder(t)
-		case tag.IsTrailer(t):
+		case t.IsTrailer():
 			inTrailer = true
-		case inTrailer && !tag.IsTrailer(t):
+		case inTrailer && !t.IsTrailer():
 			return tagSpecifiedOutOfRequiredOrder(t)
 		}
 	}
@@ -206,45 +248,41 @@ func validateOrder(msg Message) MessageRejectError {
 	return nil
 }
 
-func validateRequired(transportDD *datadictionary.DataDictionary, appDD *datadictionary.DataDictionary, msgType string, message Message) MessageRejectError {
-	if err := validateRequiredFieldMap(message, transportDD.Header.RequiredTags, message.Header); err != nil {
+func validateRequired(transportDD *datadictionary.DataDictionary, appDD *datadictionary.DataDictionary, msgType string, message *Message) MessageRejectError {
+	if err := validateRequiredFieldMap(message, transportDD.Header.RequiredTags, message.Header.FieldMap); err != nil {
 		return err
 	}
 
-	if err := validateRequiredFieldMap(message, appDD.Messages[msgType].RequiredTags, message.Body); err != nil {
+	if err := validateRequiredFieldMap(message, appDD.Messages[msgType].RequiredTags, message.Body.FieldMap); err != nil {
 		return err
 	}
 
-	if err := validateRequiredFieldMap(message, transportDD.Trailer.RequiredTags, message.Trailer); err != nil {
+	if err := validateRequiredFieldMap(message, transportDD.Trailer.RequiredTags, message.Trailer.FieldMap); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func validateRequiredFieldMap(msg Message, requiredTags map[fix.Tag]struct{}, fieldMap FieldMap) MessageRejectError {
+func validateRequiredFieldMap(msg *Message, requiredTags map[int]struct{}, fieldMap FieldMap) MessageRejectError {
 	for required := range requiredTags {
-		field := new(fix.StringValue)
-		if err := fieldMap.GetField(required, field); err != nil {
-			//FIXME: add "has..." method?
-			if err.RejectReason() == rejectReasonConditionallyRequiredFieldMissing {
-				return requiredTagMissing(required)
-			}
-			return err
+		requiredTag := Tag(required)
+		if !fieldMap.Has(requiredTag) {
+			return RequiredTagMissing(requiredTag)
 		}
 	}
 
 	return nil
 }
 
-func validateFields(transportDD *datadictionary.DataDictionary, appDD *datadictionary.DataDictionary, msgType string, message Message) MessageRejectError {
+func validateFields(transportDD *datadictionary.DataDictionary, appDD *datadictionary.DataDictionary, msgType string, message *Message) MessageRejectError {
 	for _, field := range message.fields {
 		switch {
-		case tag.IsHeader(field.Tag):
+		case field.tag.IsHeader():
 			if err := validateField(transportDD, transportDD.Header.Tags, field); err != nil {
 				return err
 			}
-		case tag.IsTrailer(field.Tag):
+		case field.tag.IsTrailer():
 			if err := validateField(transportDD, transportDD.Trailer.Tags, field); err != nil {
 				return err
 			}
@@ -258,87 +296,92 @@ func validateFields(transportDD *datadictionary.DataDictionary, appDD *datadicti
 	return nil
 }
 
-func validateField(d *datadictionary.DataDictionary, validFields datadictionary.TagSet, field fieldBytes) MessageRejectError {
-	if len(field.Value) == 0 {
-		return tagSpecifiedWithoutAValue(field.Tag)
+func validateField(d *datadictionary.DataDictionary, validFields datadictionary.TagSet, field TagValue) MessageRejectError {
+	if len(field.value) == 0 {
+		return TagSpecifiedWithoutAValue(field.tag)
 	}
 
-	if _, valid := d.FieldTypeByTag[field.Tag]; !valid {
-		return invalidTagNumber(field.Tag)
+	if _, valid := d.FieldTypeByTag[int(field.tag)]; !valid {
+		return InvalidTagNumber(field.tag)
 	}
 
-	allowedValues := d.FieldTypeByTag[field.Tag].Enums
+	allowedValues := d.FieldTypeByTag[int(field.tag)].Enums
 	if len(allowedValues) != 0 {
-		if _, validValue := allowedValues[string(field.Value)]; !validValue {
-			return ValueIsIncorrect(field.Tag)
+		if _, validValue := allowedValues[string(field.value)]; !validValue {
+			return ValueIsIncorrect(field.tag)
 		}
 	}
 
-	fieldType := d.FieldTypeByTag[field.Tag]
+	fieldType := d.FieldTypeByTag[int(field.tag)]
 	var prototype FieldValue
 	switch fieldType.Type {
-	case "STRING":
-		prototype = new(fix.StringValue)
 	case "MULTIPLESTRINGVALUE", "MULTIPLEVALUESTRING":
-		prototype = new(fix.MultipleStringValue)
+		fallthrough
 	case "MULTIPLECHARVALUE":
-		prototype = new(fix.MultipleCharValue)
+		fallthrough
 	case "CHAR":
-		prototype = new(fix.CharValue)
+		fallthrough
 	case "CURRENCY":
-		prototype = new(fix.CurrencyValue)
+		fallthrough
 	case "DATA":
-		prototype = new(fix.DataValue)
+		fallthrough
 	case "MONTHYEAR":
-		prototype = new(fix.MonthYearValue)
+		fallthrough
 	case "LOCALMKTDATE", "DATE":
-		prototype = new(fix.LocalMktDateValue)
+		fallthrough
 	case "EXCHANGE":
-		prototype = new(fix.ExchangeValue)
+		fallthrough
 	case "LANGUAGE":
-		prototype = new(fix.LanguageValue)
+		fallthrough
 	case "XMLDATA":
-		prototype = new(fix.XMLDataValue)
+		fallthrough
 	case "COUNTRY":
-		prototype = new(fix.CountryValue)
+		fallthrough
 	case "UTCTIMEONLY":
-		prototype = new(fix.UTCTimeOnlyValue)
+		fallthrough
 	case "UTCDATEONLY", "UTCDATE":
-		prototype = new(fix.UTCDateOnlyValue)
+		fallthrough
 	case "TZTIMEONLY":
-		prototype = new(fix.TZTimeOnlyValue)
+		fallthrough
 	case "TZTIMESTAMP":
-		prototype = new(fix.TZTimestampValue)
+		fallthrough
+	case "STRING":
+		prototype = new(FIXString)
+
 	case "BOOLEAN":
-		prototype = new(fix.BooleanValue)
-	case "INT":
-		prototype = new(fix.IntValue)
+		prototype = new(FIXBoolean)
+
 	case "LENGTH":
-		prototype = new(fix.LengthValue)
+		fallthrough
 	case "DAYOFMONTH":
-		prototype = new(fix.DayOfMonthValue)
+		fallthrough
 	case "NUMINGROUP":
-		prototype = new(fix.NumInGroupValue)
+		fallthrough
 	case "SEQNUM":
-		prototype = new(fix.SeqNumValue)
+		fallthrough
+	case "INT":
+		prototype = new(FIXInt)
+
 	case "UTCTIMESTAMP", "TIME":
-		prototype = new(fix.UTCTimestampValue)
-	case "FLOAT":
-		prototype = new(fix.FloatValue)
+		prototype = new(FIXUTCTimestamp)
+
 	case "QTY", "QUANTITY":
-		prototype = new(fix.QtyValue)
+		fallthrough
 	case "AMT":
-		prototype = new(fix.AmtValue)
+		fallthrough
 	case "PRICE":
-		prototype = new(fix.PriceValue)
+		fallthrough
 	case "PRICEOFFSET":
-		prototype = new(fix.PriceOffsetValue)
+		fallthrough
 	case "PERCENTAGE":
-		prototype = new(fix.PercentageValue)
+		fallthrough
+	case "FLOAT":
+		prototype = new(FIXFloat)
+
 	}
 
-	if err := prototype.Read(field.Value); err != nil {
-		return incorrectDataFormatForValue(field.Tag)
+	if err := prototype.Read(field.value); err != nil {
+		return IncorrectDataFormatForValue(field.tag)
 	}
 
 	return nil

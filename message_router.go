@@ -1,18 +1,26 @@
 package quickfix
 
-import (
-	"github.com/quickfixgo/quickfix/fix"
-	"github.com/quickfixgo/quickfix/fix/enum"
-	"github.com/quickfixgo/quickfix/fix/field"
-)
-
 type routeKey struct {
-	BeginString string
-	MsgType     string
+	FIXVersion string
+	MsgType    string
 }
 
-//A MessageRoute is a function can process a fromApp/fromAdmin callback
-type MessageRoute func(msg Message, sessionID SessionID) MessageRejectError
+//FIX ApplVerID string values
+const (
+	ApplVerIDFIX27    = "0"
+	ApplVerIDFIX30    = "1"
+	ApplVerIDFIX40    = "2"
+	ApplVerIDFIX41    = "3"
+	ApplVerIDFIX42    = "4"
+	ApplVerIDFIX43    = "5"
+	ApplVerIDFIX44    = "6"
+	ApplVerIDFIX50    = "7"
+	ApplVerIDFIX50SP1 = "8"
+	ApplVerIDFIX50SP2 = "9"
+)
+
+//A MessageRoute is a function that can process a fromApp/fromAdmin callback
+type MessageRoute func(msg *Message, sessionID SessionID) MessageRejectError
 
 //A MessageRouter is a mutex for MessageRoutes
 type MessageRouter struct {
@@ -30,56 +38,55 @@ func (c MessageRouter) AddRoute(beginString string, msgType string, router Messa
 }
 
 //Route may be called from the fromApp/fromAdmin callbacks. Messages that cannot be routed will be rejected with UnsupportedMessageType.
-func (c MessageRouter) Route(msg Message, sessionID SessionID) MessageRejectError {
-	beginString := &field.BeginStringField{}
-	err := msg.Header.Get(beginString)
+func (c MessageRouter) Route(msg *Message, sessionID SessionID) MessageRejectError {
+	beginString, err := msg.Header.GetBytes(tagBeginString)
+	if err != nil {
+		return nil
+	}
 
+	msgType, err := msg.Header.GetBytes(tagMsgType)
 	if err != nil {
 		return err
 	}
 
-	msgType := &field.MsgTypeField{}
-	err = msg.Header.Get(msgType)
-
-	if err != nil {
-		return err
-	}
-
-	return c.tryRoute(beginString, msgType, msg, sessionID)
+	return c.tryRoute(string(beginString), string(msgType), msg, sessionID)
 }
 
-func (c MessageRouter) tryRoute(beginString *field.BeginStringField, msgType *field.MsgTypeField, msg Message, sessionID SessionID) MessageRejectError {
+func (c MessageRouter) tryRoute(beginString string, msgType string, msg *Message, sessionID SessionID) MessageRejectError {
+	fixVersion := beginString
+	isAdminMsg := isAdminMessageType([]byte(msgType))
 
-	if beginString.Value == fix.BeginString_FIXT11 && !fix.IsAdminMessageType(msgType.Value) {
-		applVerID := &field.ApplVerIDField{}
-		if err := msg.Header.Get(applVerID); err != nil {
-			session, _ := LookupSession(sessionID)
-			applVerID.Value = session.TargetDefaultApplicationVersionID()
+	if beginString == BeginStringFIXT11 && !isAdminMsg {
+		var applVerID FIXString
+		if err := msg.Header.GetField(tagApplVerID, &applVerID); err != nil {
+			session, _ := lookupSession(sessionID)
+			applVerID = FIXString(session.TargetDefaultApplicationVersionID())
 		}
 
-		switch applVerID.Value {
-		case enum.ApplVerID_FIX40:
-			beginString.Value = fix.BeginString_FIX40
-		case enum.ApplVerID_FIX41:
-			beginString.Value = fix.BeginString_FIX41
-		case enum.ApplVerID_FIX42:
-			beginString.Value = fix.BeginString_FIX42
-		case enum.ApplVerID_FIX43:
-			beginString.Value = fix.BeginString_FIX43
-		case enum.ApplVerID_FIX44:
-			beginString.Value = fix.BeginString_FIX44
-		case enum.ApplVerID_FIX50, enum.ApplVerID_FIX50SP1, enum.ApplVerID_FIX50SP2:
-			beginString.Value = fix.BeginString_FIX50
+		switch applVerID {
+		case ApplVerIDFIX40:
+			fixVersion = BeginStringFIX40
+		case ApplVerIDFIX41:
+			fixVersion = BeginStringFIX41
+		case ApplVerIDFIX42:
+			fixVersion = BeginStringFIX42
+		case ApplVerIDFIX43:
+			fixVersion = BeginStringFIX43
+		case ApplVerIDFIX44:
+			fixVersion = BeginStringFIX44
+		default:
+			fixVersion = string(applVerID)
 		}
-
-		return c.tryRoute(beginString, msgType, msg, sessionID)
 	}
 
-	route, ok := c.routes[routeKey{beginString.Value, msgType.Value}]
-
-	if !ok {
-		return unsupportedMessageType()
+	if route, ok := c.routes[routeKey{fixVersion, msgType}]; ok {
+		return route(msg, sessionID)
 	}
 
-	return route(msg, sessionID)
+	switch {
+	case isAdminMsg || msgType == "j":
+		return nil
+	}
+
+	return UnsupportedMessageType()
 }

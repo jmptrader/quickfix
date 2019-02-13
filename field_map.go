@@ -2,175 +2,291 @@ package quickfix
 
 import (
 	"bytes"
-	"github.com/quickfixgo/quickfix/fix"
-	"github.com/quickfixgo/quickfix/fix/tag"
-	"math"
 	"sort"
+	"time"
 )
 
+//field stores a slice of TagValues
+type field []TagValue
+
+func fieldTag(f field) Tag {
+	return f[0].tag
+}
+
+func initField(f field, tag Tag, value []byte) {
+	f[0].init(tag, value)
+}
+
+func writeField(f field, buffer *bytes.Buffer) {
+	for _, tv := range f {
+		buffer.Write(tv.bytes)
+	}
+}
+
+// tagOrder true if tag i should occur before tag j
+type tagOrder func(i, j Tag) bool
+
+type tagSort struct {
+	tags    []Tag
+	compare tagOrder
+}
+
+func (t tagSort) Len() int           { return len(t.tags) }
+func (t tagSort) Swap(i, j int)      { t.tags[i], t.tags[j] = t.tags[j], t.tags[i] }
+func (t tagSort) Less(i, j int) bool { return t.compare(t.tags[i], t.tags[j]) }
+
 //FieldMap is a collection of fix fields that make up a fix message.
-type FieldMap interface {
-	//Tags are a copy of all tags in this field map.
-	Tags() []fix.Tag
-
-	Get(field Field) MessageRejectError
-	Has(tag fix.Tag) bool
-	GetField(tag fix.Tag, value FieldValue) MessageRejectError
+type FieldMap struct {
+	tagLookup map[Tag]field
+	tagSort
 }
 
-//MutableFieldMap is a writable FieldMap
-type MutableFieldMap interface {
-	FieldMap
+// ascending tags
+func normalFieldOrder(i, j Tag) bool { return i < j }
 
-	SetField(tag fix.Tag, field FieldValue)
-	Set(field Field)
+func (m *FieldMap) init() {
+	m.initWithOrdering(normalFieldOrder)
 }
 
-// fieldOrder true if tag i should occur before tag j
-type fieldOrder func(i, j fix.Tag) bool
-
-type fieldSort struct {
-	tags    []fix.Tag
-	compare fieldOrder
+func (m *FieldMap) initWithOrdering(ordering tagOrder) {
+	m.tagLookup = make(map[Tag]field)
+	m.compare = ordering
 }
 
-func (t fieldSort) Len() int           { return len(t.tags) }
-func (t fieldSort) Swap(i, j int)      { t.tags[i], t.tags[j] = t.tags[j], t.tags[i] }
-func (t fieldSort) Less(i, j int) bool { return t.compare(t.tags[i], t.tags[j]) }
-
-//in the message header, the first 3 tags in the message header must be 8,9,35
-func headerFieldOrder(i, j fix.Tag) bool {
-	var ordering = func(t fix.Tag) uint32 {
-		switch t {
-		case tag.BeginString:
-			return 1
-		case tag.BodyLength:
-			return 2
-		case tag.MsgType:
-			return 3
-		}
-
-		return math.MaxUint32
-	}
-
-	orderi := ordering(i)
-	orderj := ordering(j)
-
-	switch {
-	case orderi < orderj:
-		return true
-	case orderi > orderj:
-		return false
-	}
-
-	return i < j
-}
-
-// In the body, ascending tags
-func normalFieldOrder(i, j fix.Tag) bool { return i < j }
-
-// In the trailer, CheckSum (tag 10) must be last
-func trailerFieldOrder(i, j fix.Tag) bool {
-	switch {
-	case i == tag.CheckSum:
-		return false
-	case j == tag.CheckSum:
-		return true
-	}
-
-	return i < j
-}
-
-type fieldMap struct {
-	fieldLookup map[fix.Tag]*fieldBytes
-	fieldOrder
-}
-
-func (m *fieldMap) init(ordering fieldOrder) {
-	m.fieldLookup = make(map[fix.Tag]*fieldBytes)
-	m.fieldOrder = ordering
-}
-
-func (m fieldMap) Tags() []fix.Tag {
-	tags := make([]fix.Tag, 0, len(m.fieldLookup))
-	for t := range m.fieldLookup {
+//Tags returns all of the Field Tags in this FieldMap
+func (m FieldMap) Tags() []Tag {
+	tags := make([]Tag, 0, len(m.tagLookup))
+	for t := range m.tagLookup {
 		tags = append(tags, t)
 	}
 
 	return tags
 }
 
-func (m fieldMap) Get(parser Field) MessageRejectError {
+//Get parses out a field in this FieldMap. Returned reject may indicate the field is not present, or the field value is invalid.
+func (m FieldMap) Get(parser Field) MessageRejectError {
 	return m.GetField(parser.Tag(), parser)
 }
 
-func (m fieldMap) Has(tag fix.Tag) bool {
-	_, ok := m.fieldLookup[tag]
+//Has returns true if the Tag is present in this FieldMap
+func (m FieldMap) Has(tag Tag) bool {
+	_, ok := m.tagLookup[tag]
 	return ok
 }
 
-func (m fieldMap) GetField(tag fix.Tag, parser FieldValue) MessageRejectError {
-	field, ok := m.fieldLookup[tag]
-
+//GetField parses of a field with Tag tag. Returned reject may indicate the field is not present, or the field value is invalid.
+func (m FieldMap) GetField(tag Tag, parser FieldValueReader) MessageRejectError {
+	f, ok := m.tagLookup[tag]
 	if !ok {
-		return conditionallyRequiredFieldMissing(tag)
+		return ConditionallyRequiredFieldMissing(tag)
 	}
 
-	if err := parser.Read(field.Value); err != nil {
-		return incorrectDataFormatForValue(tag)
+	if err := parser.Read(f[0].value); err != nil {
+		return IncorrectDataFormatForValue(tag)
 	}
 
 	return nil
 }
 
-func (m fieldMap) SetField(tag fix.Tag, field FieldValue) {
-	m.fieldLookup[tag] = newFieldBytes(tag, field.Write())
-}
-
-func (m fieldMap) Set(field Field) {
-	m.fieldLookup[field.Tag()] = newFieldBytes(field.Tag(), field.Write())
-}
-
-func (m fieldMap) sortedTags() []fix.Tag {
-	sortedTags := make([]fix.Tag, len(m.fieldLookup))
-	for tag := range m.fieldLookup {
-		sortedTags = append(sortedTags, tag)
+//GetBytes is a zero-copy GetField wrapper for []bytes fields
+func (m FieldMap) GetBytes(tag Tag) ([]byte, MessageRejectError) {
+	f, ok := m.tagLookup[tag]
+	if !ok {
+		return nil, ConditionallyRequiredFieldMissing(tag)
 	}
 
-	sort.Sort(fieldSort{sortedTags, m.fieldOrder})
-	return sortedTags
+	return f[0].value, nil
 }
 
-func (m fieldMap) write(buffer *bytes.Buffer) {
-	tags := m.sortedTags()
+//GetBool is a GetField wrapper for bool fields
+func (m FieldMap) GetBool(tag Tag) (bool, MessageRejectError) {
+	var val FIXBoolean
+	if err := m.GetField(tag, &val); err != nil {
+		return false, err
+	}
+	return bool(val), nil
+}
 
-	for _, tag := range tags {
-		if field, ok := m.fieldLookup[tag]; ok {
-			buffer.Write(field.Data)
+//GetInt is a GetField wrapper for int fields
+func (m FieldMap) GetInt(tag Tag) (int, MessageRejectError) {
+	bytes, err := m.GetBytes(tag)
+	if err != nil {
+		return 0, err
+	}
+
+	var val FIXInt
+	if val.Read(bytes) != nil {
+		err = IncorrectDataFormatForValue(tag)
+	}
+
+	return int(val), err
+}
+
+//GetTime is a GetField wrapper for utc timestamp fields
+func (m FieldMap) GetTime(tag Tag) (t time.Time, err MessageRejectError) {
+	bytes, err := m.GetBytes(tag)
+	if err != nil {
+		return
+	}
+
+	var val FIXUTCTimestamp
+	if val.Read(bytes) != nil {
+		err = IncorrectDataFormatForValue(tag)
+	}
+
+	return val.Time, err
+}
+
+//GetString is a GetField wrapper for string fields
+func (m FieldMap) GetString(tag Tag) (string, MessageRejectError) {
+	var val FIXString
+	if err := m.GetField(tag, &val); err != nil {
+		return "", err
+	}
+	return string(val), nil
+}
+
+//GetGroup is a Get function specific to Group Fields.
+func (m FieldMap) GetGroup(parser FieldGroupReader) MessageRejectError {
+	f, ok := m.tagLookup[parser.Tag()]
+	if !ok {
+		return ConditionallyRequiredFieldMissing(parser.Tag())
+	}
+
+	if _, err := parser.Read(f); err != nil {
+		if msgRejErr, ok := err.(MessageRejectError); ok {
+			return msgRejErr
+		}
+		return IncorrectDataFormatForValue(parser.Tag())
+	}
+
+	return nil
+}
+
+//SetField sets the field with Tag tag
+func (m *FieldMap) SetField(tag Tag, field FieldValueWriter) *FieldMap {
+	return m.SetBytes(tag, field.Write())
+}
+
+//SetBytes sets bytes
+func (m *FieldMap) SetBytes(tag Tag, value []byte) *FieldMap {
+	f := m.getOrCreate(tag)
+	initField(f, tag, value)
+	return m
+}
+
+//SetBool is a SetField wrapper for bool fields
+func (m *FieldMap) SetBool(tag Tag, value bool) *FieldMap {
+	return m.SetField(tag, FIXBoolean(value))
+}
+
+//SetInt is a SetField wrapper for int fields
+func (m *FieldMap) SetInt(tag Tag, value int) *FieldMap {
+	v := FIXInt(value)
+	return m.SetBytes(tag, v.Write())
+}
+
+//SetString is a SetField wrapper for string fields
+func (m *FieldMap) SetString(tag Tag, value string) *FieldMap {
+	return m.SetBytes(tag, []byte(value))
+}
+
+//Clear purges all fields from field map
+func (m *FieldMap) Clear() {
+	m.tags = m.tags[0:0]
+	for k := range m.tagLookup {
+		delete(m.tagLookup, k)
+	}
+}
+
+//CopyInto overwrites the given FieldMap with this one
+func (m *FieldMap) CopyInto(to *FieldMap) {
+	to.tagLookup = make(map[Tag]field)
+	for tag, f := range m.tagLookup {
+		clone := make(field, 1)
+		clone[0] = f[0]
+		to.tagLookup[tag] = clone
+	}
+	to.tags = make([]Tag, len(m.tags))
+	copy(to.tags, m.tags)
+	to.compare = m.compare
+}
+
+func (m *FieldMap) add(f field) {
+	t := fieldTag(f)
+	if _, ok := m.tagLookup[t]; !ok {
+		m.tags = append(m.tags, t)
+	}
+
+	m.tagLookup[t] = f
+}
+
+func (m *FieldMap) getOrCreate(tag Tag) field {
+	if f, ok := m.tagLookup[tag]; ok {
+		f = f[:1]
+		return f
+	}
+
+	f := make(field, 1)
+	m.tagLookup[tag] = f
+	m.tags = append(m.tags, tag)
+	return f
+}
+
+//Set is a setter for fields
+func (m *FieldMap) Set(field FieldWriter) *FieldMap {
+	f := m.getOrCreate(field.Tag())
+	initField(f, field.Tag(), field.Write())
+	return m
+}
+
+//SetGroup is a setter specific to group fields
+func (m *FieldMap) SetGroup(field FieldGroupWriter) *FieldMap {
+	_, ok := m.tagLookup[field.Tag()]
+	if !ok {
+		m.tags = append(m.tags, field.Tag())
+	}
+	m.tagLookup[field.Tag()] = field.Write()
+	return m
+}
+
+func (m *FieldMap) sortedTags() []Tag {
+	sort.Sort(m)
+	return m.tags
+}
+
+func (m FieldMap) write(buffer *bytes.Buffer) {
+	for _, tag := range m.sortedTags() {
+		if f, ok := m.tagLookup[tag]; ok {
+			writeField(f, buffer)
 		}
 	}
 }
 
-func (m fieldMap) total() int {
+func (m FieldMap) total() int {
 	total := 0
-	for t, field := range m.fieldLookup {
-		switch t {
-		case tag.CheckSum: //tag does not contribute to total
-		default:
-			total += field.Total()
+	for _, fields := range m.tagLookup {
+		for _, tv := range fields {
+			switch tv.tag {
+			case tagCheckSum: //tag does not contribute to total
+			default:
+				total += tv.total()
+			}
 		}
 	}
 
 	return total
 }
 
-func (m fieldMap) length() int {
+func (m FieldMap) length() int {
 	length := 0
-	for t := range m.fieldLookup {
-		switch t {
-		case tag.BeginString, tag.BodyLength, tag.CheckSum: //tags do not contribute to length
-		default:
-			length += m.fieldLookup[t].Length()
+	for _, fields := range m.tagLookup {
+		for _, tv := range fields {
+			switch tv.tag {
+			case tagBeginString, tagBodyLength, tagCheckSum: //tags do not contribute to length
+			default:
+				length += tv.length()
+			}
 		}
 	}
 

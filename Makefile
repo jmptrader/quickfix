@@ -1,33 +1,28 @@
 all: vet test
 
-get:
-	go get github.com/golang/lint/golint
-	go get gopkg.in/check.v1
-
-GEN_MESSAGES = go run _gen/generate-messages/main.go
-GEN_FIELDS = go run _gen/generate-fields/main.go
-FIXVERS = FIX40 FIX41 FIX42 FIX43 FIX44 FIX50 FIX50SP1 FIX50SP2 FIXT11
-
 generate:
-	$(GEN_FIELDS) $(foreach vers, $(FIXVERS), spec/$(vers).xml)
-	$(foreach vers, $(FIXVERS), $(GEN_MESSAGES) spec/$(vers).xml;)
+	mkdir -p gen; cd gen; go run ../cmd/generate-fix/generate-fix.go ../spec/*.xml
+
+generate-dist:
+	cd ..; go run quickfix/cmd/generate-fix/generate-fix.go quickfix/spec/*.xml
 
 fmt:
-	go fmt ./...
+	go fmt `go list ./... | grep -v quickfix/gen`
 
 vet:
-	go vet ./...
+	go vet `go list ./... | grep -v quickfix/gen`
 
 lint:
+	go get github.com/golang/lint/golint
 	golint .
 
-test:
-	go test -v . ./datadictionary ./fix
+test: 
+	go test -v -cover . ./datadictionary ./internal
 
-_build_all:
-	go build -v ./...
+_build_all: 
+	go build -v `go list ./...`
 
-build_accept:
+build_accept: 
 	cd _test; go build -o echo_server
 
 build: _build_all build_accept
@@ -51,8 +46,5 @@ fix50sp2:
 
 ACCEPT_SUITE=fix40 fix41 fix42 fix43 fix44 fix50 fix50sp1 fix50sp2 
 accept: $(ACCEPT_SUITE)
-
-
-travis_test: all build accept
 
 .PHONY: test $(ACCEPT_SUITE)

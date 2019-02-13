@@ -2,11 +2,11 @@ package quickfix
 
 import (
 	"fmt"
-	"github.com/quickfixgo/quickfix/config"
 	"log"
 	"os"
 	"path"
-	"strings"
+
+	"github.com/quickfixgo/quickfix/config"
 )
 
 type fileLog struct {
@@ -14,12 +14,12 @@ type fileLog struct {
 	messageLogger *log.Logger
 }
 
-func (l fileLog) OnIncoming(msg string) {
-	l.messageLogger.Print(msg)
+func (l fileLog) OnIncoming(msg []byte) {
+	l.messageLogger.Print(string(msg))
 }
 
-func (l fileLog) OnOutgoing(msg string) {
-	l.messageLogger.Print(msg)
+func (l fileLog) OnOutgoing(msg []byte) {
+	l.messageLogger.Print(string(msg))
 }
 
 func (l fileLog) OnEvent(msg string) {
@@ -42,7 +42,7 @@ func NewFileLogFactory(settings *Settings) (LogFactory, error) {
 
 	var err error
 	if logFactory.globalLogPath, err = settings.GlobalSettings().Setting(config.FileLogPath); err != nil {
-		return logFactory, requiredConfigurationMissing(config.FileLogPath)
+		return logFactory, err
 	}
 
 	logFactory.sessionLogPaths = make(map[SessionID]string)
@@ -50,7 +50,7 @@ func NewFileLogFactory(settings *Settings) (LogFactory, error) {
 	for sid, sessionSettings := range settings.SessionSettings() {
 		logPath, err := sessionSettings.Setting(config.FileLogPath)
 		if err != nil {
-			return logFactory, requiredConfigurationMissing(config.FileLogPath)
+			return logFactory, err
 		}
 		logFactory.sessionLogPaths[sid] = logPath
 	}
@@ -58,7 +58,7 @@ func NewFileLogFactory(settings *Settings) (LogFactory, error) {
 	return logFactory, nil
 }
 
-func (f fileLogFactory) buildFileLog(prefix string, logPath string) (fileLog, error) {
+func newFileLog(prefix string, logPath string) (fileLog, error) {
 	l := fileLog{}
 
 	eventLogName := path.Join(logPath, prefix+".event.current.log")
@@ -68,7 +68,7 @@ func (f fileLogFactory) buildFileLog(prefix string, logPath string) (fileLog, er
 		return l, err
 	}
 
-	fileFlags := os.O_RDWR | os.O_CREATE
+	fileFlags := os.O_RDWR | os.O_CREATE | os.O_APPEND
 	eventFile, err := os.OpenFile(eventLogName, fileFlags, os.ModePerm)
 	if err != nil {
 		return l, err
@@ -79,14 +79,15 @@ func (f fileLogFactory) buildFileLog(prefix string, logPath string) (fileLog, er
 		return l, err
 	}
 
-	l.eventLogger = log.New(eventFile, "", log.Ldate|log.Ltime|log.Lmicroseconds)
-	l.messageLogger = log.New(messageFile, "", 0)
+	logFlag := log.Ldate | log.Ltime | log.Lmicroseconds | log.LUTC
+	l.eventLogger = log.New(eventFile, "", logFlag)
+	l.messageLogger = log.New(messageFile, "", logFlag)
 
 	return l, nil
 }
 
 func (f fileLogFactory) Create() (Log, error) {
-	return f.buildFileLog("GLOBAL", f.globalLogPath)
+	return newFileLog("GLOBAL", f.globalLogPath)
 }
 
 func (f fileLogFactory) CreateSessionLog(sessionID SessionID) (Log, error) {
@@ -96,10 +97,6 @@ func (f fileLogFactory) CreateSessionLog(sessionID SessionID) (Log, error) {
 		return nil, fmt.Errorf("logger not defined for %v", sessionID)
 	}
 
-	prefixParts := []string{sessionID.BeginString, sessionID.SenderCompID, sessionID.TargetCompID}
-	if len(sessionID.Qualifier) > 0 {
-		prefixParts = append(prefixParts, sessionID.Qualifier)
-	}
-
-	return f.buildFileLog(strings.Join(prefixParts, "-"), logPath)
+	prefix := sessionIDFilenamePrefix(sessionID)
+	return newFileLog(prefix, logPath)
 }

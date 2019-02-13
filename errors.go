@@ -1,9 +1,12 @@
 package quickfix
 
 import (
+	"errors"
 	"fmt"
-	"github.com/quickfixgo/quickfix/fix"
 )
+
+//ErrDoNotSend is a convenience error to indicate a DoNotSend in ToApp
+var ErrDoNotSend = errors.New("Do Not Send")
 
 //rejectReason enum values.
 const (
@@ -20,6 +23,7 @@ const (
 	rejectReasonInvalidMsgType                            = 11
 	rejectReasonTagAppearsMoreThanOnce                    = 13
 	rejectReasonTagSpecifiedOutOfRequiredOrder            = 14
+	rejectReasonRepeatingGroupFieldsOutOfOrder            = 15
 	rejectReasonIncorrectNumInGroupCountForRepeatingGroup = 16
 )
 
@@ -29,41 +33,72 @@ type MessageRejectError interface {
 
 	//RejectReason, tag 373 for session rejects, tag 380 for business rejects.
 	RejectReason() int
-	RefTagID() *fix.Tag
+	RefTagID() *Tag
 	IsBusinessReject() bool
 }
+
+//RejectLogon indicates the application is rejecting permission to logon. Implements MessageRejectError
+type RejectLogon struct {
+	Text string
+}
+
+func (e RejectLogon) Error() string { return e.Text }
+
+//RefTagID implements MessageRejectError
+func (RejectLogon) RefTagID() *Tag { return nil }
+
+//RejectReason implements MessageRejectError
+func (RejectLogon) RejectReason() int { return 0 }
+
+//IsBusinessReject implements MessageRejectError
+func (RejectLogon) IsBusinessReject() bool { return false }
 
 type messageRejectError struct {
 	rejectReason     int
 	text             string
-	refTagID         *fix.Tag
+	refTagID         *Tag
 	isBusinessReject bool
 }
 
 func (e messageRejectError) Error() string          { return e.text }
-func (e messageRejectError) RefTagID() *fix.Tag     { return e.refTagID }
+func (e messageRejectError) RefTagID() *Tag         { return e.refTagID }
 func (e messageRejectError) RejectReason() int      { return e.rejectReason }
 func (e messageRejectError) IsBusinessReject() bool { return e.isBusinessReject }
 
 //NewMessageRejectError returns a MessageRejectError with the given error message, reject reason, and optional reftagid
-func NewMessageRejectError(err string, rejectReason int, refTagID *fix.Tag) MessageRejectError {
+func NewMessageRejectError(err string, rejectReason int, refTagID *Tag) MessageRejectError {
 	return messageRejectError{text: err, rejectReason: rejectReason, refTagID: refTagID}
 }
 
 //NewBusinessMessageRejectError returns a MessageRejectError with the given error mesage, reject reason, and optional reftagid.
 //Reject is treated as a business level reject
-func NewBusinessMessageRejectError(err string, rejectReason int, refTagID *fix.Tag) MessageRejectError {
+func NewBusinessMessageRejectError(err string, rejectReason int, refTagID *Tag) MessageRejectError {
 	return messageRejectError{text: err, rejectReason: rejectReason, refTagID: refTagID, isBusinessReject: true}
 }
 
-//incorrectDataFormatForValue returns an error indicating a field that cannot be parsed as the type required.
-func incorrectDataFormatForValue(tag fix.Tag) MessageRejectError {
+//IncorrectDataFormatForValue returns an error indicating a field that cannot be parsed as the type required.
+func IncorrectDataFormatForValue(tag Tag) MessageRejectError {
 	return NewMessageRejectError("Incorrect data format for value", rejectReasonIncorrectDataFormatForValue, &tag)
 }
 
+//repeatingGroupFieldsOutOfOrder returns an error indicating a problem parsing repeating groups fields
+func repeatingGroupFieldsOutOfOrder(tag Tag, reason string) MessageRejectError {
+	if reason != "" {
+		reason = fmt.Sprintf("Repeating group fields out of order (%s)", reason)
+	} else {
+		reason = "Repeating group fields out of order"
+	}
+	return NewMessageRejectError(reason, rejectReasonRepeatingGroupFieldsOutOfOrder, &tag)
+}
+
 //ValueIsIncorrect returns an error indicating a field with value that is not valid.
-func ValueIsIncorrect(tag fix.Tag) MessageRejectError {
+func ValueIsIncorrect(tag Tag) MessageRejectError {
 	return NewMessageRejectError("Value is incorrect (out of range) for this tag", rejectReasonValueIsIncorrect, &tag)
+}
+
+//ConditionallyRequiredFieldMissing indicates that the requested field could not be found in the FIX message.
+func ConditionallyRequiredFieldMissing(tag Tag) MessageRejectError {
+	return NewBusinessMessageRejectError(fmt.Sprintf("Conditionally Required Field Missing (%d)", tag), rejectReasonConditionallyRequiredFieldMissing, &tag)
 }
 
 //valueIsIncorrectNoTag returns an error indicating a field with value that is not valid.
@@ -72,54 +107,49 @@ func valueIsIncorrectNoTag() MessageRejectError {
 	return NewMessageRejectError("Value is incorrect (out of range) for this tag", rejectReasonValueIsIncorrect, nil)
 }
 
-//invalidMessageType returns an error to indicate an invalid message type
-func invalidMessageType() MessageRejectError {
+//InvalidMessageType returns an error to indicate an invalid message type
+func InvalidMessageType() MessageRejectError {
 	return NewMessageRejectError("Invalid MsgType", rejectReasonInvalidMsgType, nil)
 }
 
-//unsupportedMessageType returns an error to indicate an unhandled message.
-func unsupportedMessageType() MessageRejectError {
+//UnsupportedMessageType returns an error to indicate an unhandled message.
+func UnsupportedMessageType() MessageRejectError {
 	return NewBusinessMessageRejectError("Unsupported Message Type", rejectReasonUnsupportedMessageType, nil)
 }
 
-//tagNotDefinedForThisMessageType returns an error for an invalid tag appearing in a message.
-func tagNotDefinedForThisMessageType(tag fix.Tag) MessageRejectError {
+//TagNotDefinedForThisMessageType returns an error for an invalid tag appearing in a message.
+func TagNotDefinedForThisMessageType(tag Tag) MessageRejectError {
 	return NewMessageRejectError("Tag not defined for this message type", rejectReasonTagNotDefinedForThisMessageType, &tag)
 }
 
 //tagAppearsMoreThanOnce return an error for multiple tags in a message not detected as a repeating group.
-func tagAppearsMoreThanOnce(tag fix.Tag) MessageRejectError {
+func tagAppearsMoreThanOnce(tag Tag) MessageRejectError {
 	return NewMessageRejectError("Tag appears more than once", rejectReasonTagAppearsMoreThanOnce, &tag)
 }
 
-//requiredTagMissing returns a validation error when a required field cannot be found in a message.
-func requiredTagMissing(tag fix.Tag) MessageRejectError {
+//RequiredTagMissing returns a validation error when a required field cannot be found in a message.
+func RequiredTagMissing(tag Tag) MessageRejectError {
 	return NewMessageRejectError("Required tag missing", rejectReasonRequiredTagMissing, &tag)
 }
 
 //incorrectNumInGroupCountForRepeatingGroup returns a validation error when the num in group value for a group does not match actual group size.
-func incorrectNumInGroupCountForRepeatingGroup(tag fix.Tag) MessageRejectError {
+func incorrectNumInGroupCountForRepeatingGroup(tag Tag) MessageRejectError {
 	return NewMessageRejectError("Incorrect NumInGroup count for repeating group", rejectReasonIncorrectNumInGroupCountForRepeatingGroup, &tag)
 }
 
 //tagSpecifiedOutOfRequiredOrder returns validation error when the group order does not match the spec.
-func tagSpecifiedOutOfRequiredOrder(tag fix.Tag) MessageRejectError {
+func tagSpecifiedOutOfRequiredOrder(tag Tag) MessageRejectError {
 	return NewMessageRejectError("Tag specified out of required order", rejectReasonTagSpecifiedOutOfRequiredOrder, &tag)
 }
 
-//tagSpecifiedWithoutAValue returns a validation error for when a field has no value.
-func tagSpecifiedWithoutAValue(tag fix.Tag) MessageRejectError {
+//TagSpecifiedWithoutAValue returns a validation error for when a field has no value.
+func TagSpecifiedWithoutAValue(tag Tag) MessageRejectError {
 	return NewMessageRejectError("Tag specified without a value", rejectReasonTagSpecifiedWithoutAValue, &tag)
 }
 
-//invalidTagNumber returns a validation error for messages with invalid tags.
-func invalidTagNumber(tag fix.Tag) MessageRejectError {
+//InvalidTagNumber returns a validation error for messages with invalid tags.
+func InvalidTagNumber(tag Tag) MessageRejectError {
 	return NewMessageRejectError("Invalid tag number", rejectReasonInvalidTagNumber, &tag)
-}
-
-//conditionallyRequiredFieldMissing indicates that the requested field could not be found in the FIX message.
-func conditionallyRequiredFieldMissing(tag fix.Tag) MessageRejectError {
-	return NewBusinessMessageRejectError("Conditionally required field missing", rejectReasonConditionallyRequiredFieldMissing, &tag)
 }
 
 //compIDProblem creates a reject for msg where msg has invalid comp id values.
@@ -130,9 +160,4 @@ func compIDProblem() MessageRejectError {
 //sendingTimeAccuracyProblem creates a reject for a msg with stale or invalid sending time.
 func sendingTimeAccuracyProblem() MessageRejectError {
 	return NewMessageRejectError("SendingTime accuracy problem", rejectReasonSendingTimeAccuracyProblem, nil)
-}
-
-//requiredConfigurationMissing indicates a missing required conditional configuration option.
-func requiredConfigurationMissing(setting string) error {
-	return fmt.Errorf("missing configuration: %v", setting)
 }

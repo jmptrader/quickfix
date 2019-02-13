@@ -1,300 +1,389 @@
 package quickfix
 
 import (
-	"github.com/quickfixgo/quickfix/fix"
-	"github.com/quickfixgo/quickfix/fix/field"
-	"github.com/quickfixgo/quickfix/fix/tag"
+	"bytes"
 	"time"
+
+	"github.com/quickfixgo/quickfix/internal"
 )
 
-type inSession struct {
-}
+type inSession struct{ loggedOn }
 
-func (state inSession) FixMsgIn(session *Session, msg Message) (nextState sessionState) {
-	msgType := field.MsgTypeField{}
-	if err := msg.Header.Get(&msgType); err == nil {
-		switch msgType.Value {
-		//logon
-		case "A":
-			return state.handleLogon(session, msg)
-		//logout
-		case "5":
-			return state.handleLogout(session, msg)
-		//test request
-		case "1":
-			return state.handleTestRequest(session, msg)
-		//resend request
-		case "2":
-			return state.handleResendRequest(session, msg)
-		//sequence reset
-		case "4":
-			return state.handleSequenceReset(session, msg)
-		default:
-			if err := session.verify(msg); err != nil {
-				return state.processReject(session, msg, err)
+func (state inSession) String() string { return "In Session" }
+
+func (state inSession) FixMsgIn(session *session, msg *Message) sessionState {
+	msgType, err := msg.Header.GetBytes(tagMsgType)
+	if err != nil {
+		return handleStateError(session, err)
+	}
+
+	switch {
+	case bytes.Equal(msgTypeLogon, msgType):
+		if err := session.handleLogon(msg); err != nil {
+			if err := session.initiateLogoutInReplyTo("", msg); err != nil {
+				return handleStateError(session, err)
 			}
+			return logoutState{}
+		}
+
+		return state
+	case bytes.Equal(msgTypeLogout, msgType):
+		return state.handleLogout(session, msg)
+	case bytes.Equal(msgTypeResendRequest, msgType):
+		return state.handleResendRequest(session, msg)
+	case bytes.Equal(msgTypeSequenceReset, msgType):
+		return state.handleSequenceReset(session, msg)
+	case bytes.Equal(msgTypeTestRequest, msgType):
+		return state.handleTestRequest(session, msg)
+	default:
+		if err := session.verify(msg); err != nil {
+			return state.processReject(session, msg, err)
 		}
 	}
 
-	session.store.IncrNextTargetMsgSeqNum()
+	if err := session.store.IncrNextTargetMsgSeqNum(); err != nil {
+		return handleStateError(session, err)
+	}
 
 	return state
 }
 
-func (state inSession) Timeout(session *Session, event event) (nextState sessionState) {
+func (state inSession) Timeout(session *session, event internal.Event) (nextState sessionState) {
 	switch event {
-	case needHeartbeat:
-		heartBt := NewMessageBuilder()
-		heartBt.Header().Set(field.NewMsgType("0"))
-		session.send(heartBt)
-	case peerTimeout:
-		testReq := NewMessageBuilder()
-		testReq.Header().Set(field.NewMsgType("1"))
-		testReq.Body().Set(field.NewTestReqID("TEST"))
-		session.send(testReq)
-		session.peerTimer.Reset(time.Duration(int64(1.2 * float64(session.heartBeatTimeout))))
-		return pendingTimeout{}
-	}
-	return state
-}
-
-func (state inSession) handleLogon(session *Session, msg Message) (nextState sessionState) {
-	if err := session.handleLogon(msg); err != nil {
-		return state.initiateLogout(session, "")
+	case internal.NeedHeartbeat:
+		heartBt := NewMessage()
+		heartBt.Header.SetField(tagMsgType, FIXString("0"))
+		if err := session.send(heartBt); err != nil {
+			return handleStateError(session, err)
+		}
+	case internal.PeerTimeout:
+		testReq := NewMessage()
+		testReq.Header.SetField(tagMsgType, FIXString("1"))
+		testReq.Body.SetField(tagTestReqID, FIXString("TEST"))
+		if err := session.send(testReq); err != nil {
+			return handleStateError(session, err)
+		}
+		session.log.OnEvent("Sent test request TEST")
+		session.peerTimer.Reset(time.Duration(float64(1.2) * float64(session.HeartBtInt)))
+		return pendingTimeout{state}
 	}
 
 	return state
 }
 
-func (state inSession) handleLogout(session *Session, msg Message) (nextState sessionState) {
-	session.log.OnEvent("Received logout request")
-	state.generateLogout(session)
-	session.application.OnLogout(session.sessionID)
+func (state inSession) handleLogout(session *session, msg *Message) (nextState sessionState) {
+	if err := session.verifySelect(msg, false, false); err != nil {
+		return state.processReject(session, msg, err)
+	}
+
+	if session.IsLoggedOn() {
+		session.log.OnEvent("Received logout request")
+		session.log.OnEvent("Sending logout response")
+
+		if err := session.sendLogoutInReplyTo("", msg); err != nil {
+			session.logError(err)
+		}
+	} else {
+		session.log.OnEvent("Received logout response")
+	}
+
+	if err := session.store.IncrNextTargetMsgSeqNum(); err != nil {
+		session.logError(err)
+	}
+
+	if session.ResetOnLogout {
+		if err := session.dropAndReset(); err != nil {
+			session.logError(err)
+		}
+	}
 
 	return latentState{}
 }
 
-func (state inSession) handleSequenceReset(session *Session, msg Message) (nextState sessionState) {
-	gapFillFlag := new(fix.BooleanField)
-	msg.Body.GetField(tag.GapFillFlag, gapFillFlag)
-
-	if err := session.verifySelect(msg, gapFillFlag.Value, gapFillFlag.Value); err != nil {
+func (state inSession) handleTestRequest(session *session, msg *Message) (nextState sessionState) {
+	if err := session.verify(msg); err != nil {
 		return state.processReject(session, msg, err)
 	}
-
-	newSeqNo := new(fix.IntField)
-	if err := msg.Body.GetField(tag.NewSeqNo, newSeqNo); err == nil {
-		expectedSeqNum := session.store.NextTargetMsgSeqNum()
-		session.log.OnEventf("Received SequenceReset FROM: %v TO: %v", expectedSeqNum, newSeqNo.Value)
-
-		switch {
-		case newSeqNo.Value > expectedSeqNum:
-			session.store.SetNextTargetMsgSeqNum(newSeqNo.Value)
-		case newSeqNo.Value < expectedSeqNum:
-			//FIXME: to be compliant with legacy tests, do not include tag in reftagid? (11c_NewSeqNoLess)
-			session.doReject(msg, valueIsIncorrectNoTag())
+	var testReq FIXString
+	if err := msg.Body.GetField(tagTestReqID, &testReq); err != nil {
+		session.log.OnEvent("Test Request with no testRequestID")
+	} else {
+		heartBt := NewMessage()
+		heartBt.Header.SetField(tagMsgType, FIXString("0"))
+		heartBt.Body.SetField(tagTestReqID, testReq)
+		if err := session.sendInReplyTo(heartBt, msg); err != nil {
+			return handleStateError(session, err)
 		}
 	}
 
+	if err := session.store.IncrNextTargetMsgSeqNum(); err != nil {
+		return handleStateError(session, err)
+	}
 	return state
 }
 
-func (state inSession) handleResendRequest(session *Session, msg Message) (nextState sessionState) {
+func (state inSession) handleSequenceReset(session *session, msg *Message) (nextState sessionState) {
+	var gapFillFlag FIXBoolean
+	if msg.Body.Has(tagGapFillFlag) {
+		if err := msg.Body.GetField(tagGapFillFlag, &gapFillFlag); err != nil {
+			return state.processReject(session, msg, err)
+		}
+	}
+
+	if err := session.verifySelect(msg, bool(gapFillFlag), bool(gapFillFlag)); err != nil {
+		return state.processReject(session, msg, err)
+	}
+
+	var newSeqNo FIXInt
+	if err := msg.Body.GetField(tagNewSeqNo, &newSeqNo); err == nil {
+		expectedSeqNum := FIXInt(session.store.NextTargetMsgSeqNum())
+		session.log.OnEventf("Received SequenceReset FROM: %v TO: %v", expectedSeqNum, newSeqNo)
+
+		switch {
+		case newSeqNo > expectedSeqNum:
+			if err := session.store.SetNextTargetMsgSeqNum(int(newSeqNo)); err != nil {
+				return handleStateError(session, err)
+			}
+		case newSeqNo < expectedSeqNum:
+			//FIXME: to be compliant with legacy tests, do not include tag in reftagid? (11c_NewSeqNoLess)
+			if err := session.doReject(msg, valueIsIncorrectNoTag()); err != nil {
+				return handleStateError(session, err)
+			}
+		}
+	}
+	return state
+}
+
+func (state inSession) handleResendRequest(session *session, msg *Message) (nextState sessionState) {
 	if err := session.verifyIgnoreSeqNumTooHighOrLow(msg); err != nil {
 		return state.processReject(session, msg, err)
 	}
 
 	var err error
-	beginSeqNoField := new(fix.IntValue)
-	if err = msg.Body.GetField(tag.BeginSeqNo, beginSeqNoField); err != nil {
-		return state.processReject(session, msg, requiredTagMissing(tag.BeginSeqNo))
+	var beginSeqNoField FIXInt
+	if err = msg.Body.GetField(tagBeginSeqNo, &beginSeqNoField); err != nil {
+		return state.processReject(session, msg, RequiredTagMissing(tagBeginSeqNo))
 	}
 
-	beginSeqNo := beginSeqNoField.Value
+	beginSeqNo := beginSeqNoField
 
-	endSeqNoField := new(fix.IntField)
-	if err = msg.Body.GetField(tag.EndSeqNo, endSeqNoField); err != nil {
-		return state.processReject(session, msg, requiredTagMissing(tag.EndSeqNo))
+	var endSeqNoField FIXInt
+	if err = msg.Body.GetField(tagEndSeqNo, &endSeqNoField); err != nil {
+		return state.processReject(session, msg, RequiredTagMissing(tagEndSeqNo))
 	}
 
-	endSeqNo := endSeqNoField.Value
+	endSeqNo := int(endSeqNoField)
 
 	session.log.OnEventf("Received ResendRequest FROM: %d TO: %d", beginSeqNo, endSeqNo)
-	expectedSeqNum := session.store.NextTargetMsgSeqNum()
+	expectedSeqNum := session.store.NextSenderMsgSeqNum()
 
-	if (session.sessionID.BeginString >= fix.BeginString_FIX42 && endSeqNo == 0) ||
-		(session.sessionID.BeginString <= fix.BeginString_FIX42 && endSeqNo == 999999) ||
+	if (session.sessionID.BeginString >= BeginStringFIX42 && endSeqNo == 0) ||
+		(session.sessionID.BeginString <= BeginStringFIX42 && endSeqNo == 999999) ||
 		(endSeqNo >= expectedSeqNum) {
 		endSeqNo = expectedSeqNum - 1
 	}
 
-	state.resendMessages(session, beginSeqNo, endSeqNo)
-	session.store.IncrNextTargetMsgSeqNum()
+	if err := state.resendMessages(session, int(beginSeqNo), endSeqNo, *msg); err != nil {
+		return handleStateError(session, err)
+	}
+
+	if err := session.checkTargetTooLow(msg); err != nil {
+		return state
+	}
+
+	if err := session.checkTargetTooHigh(msg); err != nil {
+		return state
+	}
+
+	if err := session.store.IncrNextTargetMsgSeqNum(); err != nil {
+		return handleStateError(session, err)
+	}
 	return state
 }
 
-func (state inSession) resendMessages(session *Session, beginSeqNo, endSeqNo int) {
-	msgs := session.store.GetMessages(beginSeqNo, endSeqNo)
+func (state inSession) resendMessages(session *session, beginSeqNo, endSeqNo int, inReplyTo Message) (err error) {
+	if session.DisableMessagePersist {
+		err = state.generateSequenceReset(session, beginSeqNo, endSeqNo+1, inReplyTo)
+		return
+	}
+
+	msgs, err := session.store.GetMessages(beginSeqNo, endSeqNo)
+	if err != nil {
+		session.log.OnEventf("error retrieving messages from store: %s", err.Error())
+		return
+	}
 
 	seqNum := beginSeqNo
 	nextSeqNum := seqNum
+	msg := NewMessage()
+	for _, msgBytes := range msgs {
+		_ = ParseMessageWithDataDictionary(msg, bytes.NewBuffer(msgBytes), session.transportDataDictionary, session.appDataDictionary)
+		msgType, _ := msg.Header.GetBytes(tagMsgType)
+		sentMessageSeqNum, _ := msg.Header.GetInt(tagMsgSeqNum)
 
-	var msgBytes []byte
-	var ok bool
-	for {
-		if msgBytes, ok = <-msgs; !ok {
-			//gapfill for catch-up
-			if seqNum != nextSeqNum {
-				state.generateSequenceReset(session, seqNum, nextSeqNum)
+		if isAdminMessageType(msgType) {
+			nextSeqNum = sentMessageSeqNum + 1
+			continue
+		}
+
+		if !session.resend(msg) {
+			nextSeqNum = sentMessageSeqNum + 1
+			continue
+		}
+
+		if seqNum != sentMessageSeqNum {
+			if err = state.generateSequenceReset(session, seqNum, sentMessageSeqNum, inReplyTo); err != nil {
+				return err
 			}
-
-			return
 		}
 
-		msg, _ := parseMessage(msgBytes)
+		session.log.OnEventf("Resending Message: %v", sentMessageSeqNum)
+		msgBytes = msg.build()
+		session.sendBytes(msgBytes)
 
-		msgType := new(fix.StringValue)
-		msg.Header.GetField(tag.MsgType, msgType)
+		seqNum = sentMessageSeqNum + 1
+		nextSeqNum = seqNum
+	}
 
-		sentMessageSeqNum := new(fix.IntValue)
-		msg.Header.GetField(tag.MsgSeqNum, sentMessageSeqNum)
-
-		if fix.IsAdminMessageType(msgType.Value) {
-			nextSeqNum = sentMessageSeqNum.Value + 1
-		} else {
-
-			if seqNum != sentMessageSeqNum.Value {
-				state.generateSequenceReset(session, seqNum, sentMessageSeqNum.Value)
-			}
-
-			session.resend(msg)
-			seqNum = sentMessageSeqNum.Value + 1
-			nextSeqNum = seqNum
+	if seqNum != nextSeqNum { // gapfill for catch-up
+		if err = state.generateSequenceReset(session, seqNum, nextSeqNum, inReplyTo); err != nil {
+			return err
 		}
 	}
-}
-
-func (state inSession) handleTestRequest(session *Session, msg Message) (nextState sessionState) {
-	if err := session.verify(msg); err != nil {
-		return state.processReject(session, msg, err)
-	}
-
-	var testReq field.TestReqIDField
-	if err := msg.Body.Get(&testReq); err != nil {
-		session.log.OnEvent("Test Request with no testRequestID")
-	} else {
-		heartBt := NewMessageBuilder()
-		heartBt.Header().Set(field.NewMsgType("0"))
-		heartBt.Body().Set(field.NewTestReqID(testReq.Value))
-		session.send(heartBt)
-	}
-
-	session.store.IncrNextTargetMsgSeqNum()
-
-	return state
-}
-
-func (state inSession) processReject(session *Session, msg Message, rej MessageRejectError) (nextState sessionState) {
-	switch TypedError := rej.(type) {
-	case targetTooHigh:
-
-		switch session.currentState.(type) {
-		default:
-			session.doTargetTooHigh(TypedError)
-		case resendState:
-			//assumes target too high reject already sent
-		}
-		session.messageStash[TypedError.ReceivedTarget] = msg
-		return resendState{}
-
-	case targetTooLow:
-		return state.doTargetTooLow(session, msg, TypedError)
-	case incorrectBeginString:
-		return state.initiateLogout(session, rej.Error())
-	}
-
-	switch rej.RejectReason() {
-	case rejectReasonCompIDProblem, rejectReasonSendingTimeAccuracyProblem:
-		session.doReject(msg, rej)
-		return state.initiateLogout(session, "")
-	default:
-		session.doReject(msg, rej)
-		session.store.IncrNextTargetMsgSeqNum()
-		return state
-	}
-}
-
-func (state inSession) doTargetTooLow(session *Session, msg Message, rej targetTooLow) (nextState sessionState) {
-	posDupFlag := new(fix.BooleanValue)
-	if err := msg.Header.GetField(tag.PossDupFlag, posDupFlag); err == nil && posDupFlag.Value {
-
-		origSendingTime := new(fix.UTCTimestampValue)
-		if err = msg.Header.GetField(tag.OrigSendingTime, origSendingTime); err != nil {
-			session.doReject(msg, requiredTagMissing(tag.OrigSendingTime))
-			return state
-		}
-
-		sendingTime := new(fix.UTCTimestampValue)
-		msg.Header.GetField(tag.SendingTime, sendingTime)
-
-		if sendingTime.Value.Before(origSendingTime.Value) {
-			session.doReject(msg, sendingTimeAccuracyProblem())
-			return state.initiateLogout(session, "")
-		}
-
-		if appReject := session.fromCallback(msg); appReject != nil {
-			session.doReject(msg, appReject)
-			return state.initiateLogout(session, "")
-		}
-	} else {
-		return state.initiateLogout(session, rej.Error())
-	}
-
-	return state
-}
-
-func (state *inSession) initiateLogout(session *Session, reason string) (nextState logoutState) {
-	state.generateLogoutWithReason(session, reason)
-	time.AfterFunc(time.Duration(2)*time.Second, func() { session.sessionEvent <- logoutTimeout })
 
 	return
 }
 
-func (state *inSession) generateSequenceReset(session *Session, beginSeqNo int, endSeqNo int) {
-	sequenceReset := NewMessageBuilder()
-	session.fillDefaultHeader(sequenceReset)
+func (state inSession) processReject(session *session, msg *Message, rej MessageRejectError) sessionState {
+	switch TypedError := rej.(type) {
+	case targetTooHigh:
 
-	sequenceReset.Header().Set(field.NewMsgType("4"))
-	sequenceReset.Header().Set(field.NewMsgSeqNum(beginSeqNo))
-	sequenceReset.Header().Set(field.NewPossDupFlag(true))
-	sequenceReset.Body().Set(field.NewNewSeqNo(endSeqNo))
-	sequenceReset.Body().Set(field.NewGapFillFlag(true))
+		var nextState resendState
+		switch currentState := session.State.(type) {
+		case resendState:
+			//assumes target too high reject already sent
+			nextState = currentState
+		default:
+			var err error
+			if nextState, err = session.doTargetTooHigh(TypedError); err != nil {
+				return handleStateError(session, err)
+			}
+		}
 
-	origSendingTime := new(fix.StringValue)
-	if err := sequenceReset.Header().GetField(tag.SendingTime, origSendingTime); err == nil {
-		sequenceReset.Header().Set(fix.NewStringField(tag.OrigSendingTime, origSendingTime.Value))
+		if nextState.messageStash == nil {
+			nextState.messageStash = make(map[int]*Message)
+		}
+
+		nextState.messageStash[TypedError.ReceivedTarget] = msg
+		//do not reclaim stashed message
+		msg.keepMessage = true
+
+		return nextState
+
+	case targetTooLow:
+		return state.doTargetTooLow(session, msg, TypedError)
+	case incorrectBeginString:
+		if err := session.initiateLogout(rej.Error()); err != nil {
+			return handleStateError(session, err)
+		}
+		return logoutState{}
 	}
 
-	//FIXME error check?
-	msgBytes, _ := sequenceReset.Build()
+	switch rej.RejectReason() {
+	case rejectReasonCompIDProblem, rejectReasonSendingTimeAccuracyProblem:
+		if err := session.doReject(msg, rej); err != nil {
+			return handleStateError(session, err)
+		}
+
+		if err := session.initiateLogout(""); err != nil {
+			return handleStateError(session, err)
+		}
+		return logoutState{}
+	default:
+		if err := session.doReject(msg, rej); err != nil {
+			return handleStateError(session, err)
+		}
+
+		if err := session.store.IncrNextTargetMsgSeqNum(); err != nil {
+			return handleStateError(session, err)
+		}
+		return state
+	}
+}
+
+func (state inSession) doTargetTooLow(session *session, msg *Message, rej targetTooLow) (nextState sessionState) {
+	var posDupFlag FIXBoolean
+	if msg.Header.Has(tagPossDupFlag) {
+		if err := msg.Header.GetField(tagPossDupFlag, &posDupFlag); err != nil {
+			if rejErr := session.doReject(msg, err); rejErr != nil {
+				return handleStateError(session, rejErr)
+			}
+			return state
+		}
+	}
+
+	if !posDupFlag.Bool() {
+		if err := session.initiateLogout(rej.Error()); err != nil {
+			return handleStateError(session, err)
+		}
+		return logoutState{}
+	}
+
+	if !msg.Header.Has(tagOrigSendingTime) {
+		if err := session.doReject(msg, RequiredTagMissing(tagOrigSendingTime)); err != nil {
+			return handleStateError(session, err)
+		}
+		return state
+	}
+
+	var origSendingTime FIXUTCTimestamp
+	if err := msg.Header.GetField(tagOrigSendingTime, &origSendingTime); err != nil {
+		if rejErr := session.doReject(msg, err); rejErr != nil {
+			return handleStateError(session, rejErr)
+		}
+		return state
+	}
+
+	sendingTime := new(FIXUTCTimestamp)
+	if err := msg.Header.GetField(tagSendingTime, sendingTime); err != nil {
+		return state.processReject(session, msg, err)
+	}
+
+	if sendingTime.Before(origSendingTime.Time) {
+		if err := session.doReject(msg, sendingTimeAccuracyProblem()); err != nil {
+			return handleStateError(session, err)
+		}
+
+		if err := session.initiateLogout(""); err != nil {
+			return handleStateError(session, err)
+		}
+		return logoutState{}
+	}
+
+	return state
+}
+
+func (state *inSession) generateSequenceReset(session *session, beginSeqNo int, endSeqNo int, inReplyTo Message) (err error) {
+	sequenceReset := NewMessage()
+	session.fillDefaultHeader(sequenceReset, &inReplyTo)
+
+	sequenceReset.Header.SetField(tagMsgType, FIXString("4"))
+	sequenceReset.Header.SetField(tagMsgSeqNum, FIXInt(beginSeqNo))
+	sequenceReset.Header.SetField(tagPossDupFlag, FIXBoolean(true))
+	sequenceReset.Body.SetField(tagNewSeqNo, FIXInt(endSeqNo))
+	sequenceReset.Body.SetField(tagGapFillFlag, FIXBoolean(true))
+
+	var origSendingTime FIXString
+	if err := sequenceReset.Header.GetField(tagSendingTime, &origSendingTime); err == nil {
+		sequenceReset.Header.SetField(tagOrigSendingTime, origSendingTime)
+	}
+
+	session.application.ToAdmin(sequenceReset, session.sessionID)
+
+	msgBytes := sequenceReset.build()
+
 	session.sendBytes(msgBytes)
-}
+	session.log.OnEventf("Sent SequenceReset TO: %v", endSeqNo)
 
-func (state *inSession) generateLogout(session *Session) {
-	state.generateLogoutWithReason(session, "")
-}
-
-func (state *inSession) generateLogoutWithReason(session *Session, reason string) {
-	reply := NewMessageBuilder()
-	reply.Header().Set(field.NewMsgType("5"))
-	reply.Header().Set(field.NewBeginString(session.sessionID.BeginString))
-	reply.Header().Set(field.NewTargetCompID(session.sessionID.TargetCompID))
-	reply.Header().Set(field.NewSenderCompID(session.sessionID.SenderCompID))
-
-	if reason != "" {
-		reply.Body().Set(field.NewText(reason))
-	}
-
-	session.send(reply)
-	session.log.OnEvent("Sending logout response")
+	return
 }

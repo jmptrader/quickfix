@@ -7,8 +7,8 @@ import (
 //XMLDoc is the unmarshalled root of a FIX Dictionary.
 type XMLDoc struct {
 	Type        string `xml:"type,attr"`
-	Major       int    `xml:"major,attr"`
-	Minor       int    `xml:"minor,attr"`
+	Major       string `xml:"major,attr"`
+	Minor       string `xml:"minor,attr"`
 	ServicePack int    `xml:"servicepack,attr"`
 
 	Header     *XMLComponent   `xml:"header"`
@@ -48,4 +48,16 @@ type XMLComponentMember struct {
 	Required string `xml:"required,attr"`
 
 	Members []*XMLComponentMember `xml:",any"`
+}
+
+func (member XMLComponentMember) isComponent() bool {
+	return member.XMLName.Local == "component"
+}
+
+func (member XMLComponentMember) isGroup() bool {
+	return member.XMLName.Local == "group"
+}
+
+func (member XMLComponentMember) isRequired() bool {
+	return member.Required == "Y"
 }
