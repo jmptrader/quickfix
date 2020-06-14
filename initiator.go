@@ -3,11 +3,11 @@ package quickfix
 import (
 	"bufio"
 	"crypto/tls"
-	"net"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/quickfixgo/quickfix/config"
+	"golang.org/x/net/proxy"
 )
 
 //Initiator initiates connections and processes messages for all sessions.
@@ -35,15 +35,14 @@ func (i *Initiator) Start() (err error) {
 			return
 		}
 
-		dialTimeout := time.Duration(0)
-		if settings.HasSetting(config.SocketTimeout) {
-			if dialTimeout, err = settings.DurationSetting(config.SocketTimeout); err != nil {
-				return
-			}
+		var dialer proxy.Dialer
+		if dialer, err = loadDialerConfig(settings); err != nil {
+			return
 		}
+
 		i.wg.Add(1)
 		go func(sessID SessionID) {
-			i.handleConnection(i.sessions[sessID], tlsConfig, dialTimeout)
+			i.handleConnection(i.sessions[sessID], tlsConfig, dialer)
 			i.wg.Done()
 		}(sessionID)
 	}
@@ -121,7 +120,7 @@ func (i *Initiator) waitForReconnectInterval(reconnectInterval time.Duration) bo
 	return true
 }
 
-func (i *Initiator) handleConnection(session *session, tlsConfig *tls.Config, dialTimeout time.Duration) {
+func (i *Initiator) handleConnection(session *session, tlsConfig *tls.Config, dialer proxy.Dialer) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -148,27 +147,26 @@ func (i *Initiator) handleConnection(session *session, tlsConfig *tls.Config, di
 		address := session.SocketConnectAddress[connectionAttempt%len(session.SocketConnectAddress)]
 		session.log.OnEventf("Connecting to: %v", address)
 
-		var netConn net.Conn
-		if tlsConfig != nil {
-			tlsConn, err := tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", address, tlsConfig)
-			if err != nil {
-				session.log.OnEventf("Failed to connect: %v", err)
-				goto reconnect
+		netConn, err := dialer.Dial("tcp", address)
+		if err != nil {
+			session.log.OnEventf("Failed to connect: %v", err)
+			goto reconnect
+		} else if tlsConfig != nil {
+			// Unless InsecureSkipVerify is true, server name config is required for TLS
+			// to verify the received certificate
+			if !tlsConfig.InsecureSkipVerify && len(tlsConfig.ServerName) == 0 {
+				serverName := address
+				if c := strings.LastIndex(serverName, ":"); c > 0 {
+					serverName = serverName[:c]
+				}
+				tlsConfig.ServerName = serverName
 			}
-
-			err = tlsConn.Handshake()
-			if err != nil {
-				session.log.OnEventf("Failed handshake:%v", err)
+			tlsConn := tls.Client(netConn, tlsConfig)
+			if err = tlsConn.Handshake(); err != nil {
+				session.log.OnEventf("Failed handshake: %v", err)
 				goto reconnect
 			}
 			netConn = tlsConn
-		} else {
-			var err error
-			netConn, err = net.Dial("tcp", address)
-			if err != nil {
-				session.log.OnEventf("Failed to connect: %v", err)
-				goto reconnect
-			}
 		}
 
 		msgIn = make(chan fixIn)
